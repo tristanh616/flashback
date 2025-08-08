@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Flashback – Host Screen</title>
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body>
+  <h1>Host View – Flashback</h1>
+
+  <div>
+    <input id="questionInput" placeholder="Question text" />
+    <input id="correctInput" placeholder="Correct answer" />
+    <button onclick="sendQuestion()">Send Question</button>
+  </div>
+
+  <h3>Submitted Answers:</h3>
+  <ul id="answers"></ul>
+
+  <h3>Validate Correct Players:</h3>
+  <div id="playerValidation">
+    {% for player in players %}
+      <label><input type="checkbox" class="correct" value="{{ player }}"> {{ player }}</label><br />
+    {% endfor %}
+    <button onclick="validateAnswers()">Validate Answers</button>
+  </div>
+
+  <h3>Leaderboard:</h3>
+  <ul id="leaderboard"></ul>
+
+  <button onclick="endGame()">End Game</button>
+
+  <script>
+    const socket = io(); // ← Manquant dans ton code
+    const gameId = "{{ game_id }}";
+    const currentPlayers = JSON.parse('{{ players | tojson | safe }}');
+
+    console.log("Current Players:", currentPlayers);
+
+    function sendQuestion() {
+      const question = document.getElementById("questionInput").value;
+      const correct = document.getElementById("correctInput").value;
+      socket.emit("start_question", {
+        game_id: gameId,
+        question: question,
+        correct_answer: correct
+      });
+    }
+
+    socket.on("answer_received", (data) => {
+      const li = document.createElement("li");
+      li.textContent = `${data.player} answered.`;
+      document.getElementById("answers").appendChild(li);
+    });
+
+    function validateAnswers() {
+      const correctPlayers = Array.from(document.querySelectorAll(".correct:checked")).map(cb => cb.value);
+      socket.emit("validate_answers", {
+        game_id: gameId,
+        correct_players: correctPlayers
+      });
+    }
+
+    socket.on("update_scores", (scores) => {
+      const board = document.getElementById("leaderboard");
+      board.innerHTML = '';
+      Object.entries(scores).forEach(([player, score]) => {
+        const li = document.createElement("li");
+        li.textContent = `${player}: ${score}`;
+        board.appendChild(li);
+      });
+    });
+
+    function endGame() {
+      socket.emit("end_game", { game_id: gameId });
+      alert("Game ended and winners saved.");
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Flashback</title>
+  <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+  <div class="center-box">
+    <h1>FLASHBACK</h1>
+    <button onclick="location.href='/host'">Create</button>
+    <button onclick="let code=prompt('Enter game code'); if(code) location.href='/game/'+code+'/YOU';">Join</button>
+  </div>
+</body>
+</html>
+
+
+### host.html ###
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Host Game</title>
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  <script>
+  const socket = io();
+  const player = prompt("Enter your name");
+  const gameId = "{{ game_id }}";
+  
+  if (player) {
+    socket.emit('join', { game_id: gameId, player });
+  }
+
+  socket.on('player_joined', (data) => {
+    const list = document.getElementById("player-list");
+    if (list) {
+      const li = document.createElement("li");
+      li.innerText = data.player;
+      list.appendChild(li);
+    }
+  });
+</script>
+</head>
+<body onload="createGame()">
+  <h1>Creating Game...</h1>
+</body>
+</html>
