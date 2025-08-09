@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Waiting Room – Flashback</title>
+  <script src="https://cdn.socket.io/4.3.2/socket.io.min.js"></script>
+</head>
+<body>
+  <h1>Welcome, {{ username }}</h1>
+  <h2>You're in the game: {{ game_id }}</h2>
+  <p>Waiting for the host to start the game...</p>
+
+  <script>
+    const gameId = "{{ game_id }}";
+    const username = "{{ username }}";
+    const socket = io();
+
+    socket.emit("join_game", { game_id: gameId, username: username });
+
+    // Optional: redirect when game starts
+    socket.on("next_question", () => {
+      window.location.href = `/play/${gameId}/${username}`;
+    });
+  </script>
+</body>
+</html>

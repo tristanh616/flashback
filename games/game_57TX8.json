@@ -1,0 +1,19 @@
+{
+    "code": "57TX8",
+    "server_name": "fff",
+    "modes": [
+        "movie_quote"
+    ],
+    "team_mode": false,
+    "teams": {
+        "fffa": {
+            "score": 0,
+            "answers": []
+        }
+    },
+    "questions": [],
+    "current_question": 0,
+    "history": [],
+    "answered_teams": [],
+    "answers_current": {}
+}

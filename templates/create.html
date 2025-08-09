@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Create Game</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+</head>
+<body>
+    <form method="post">
+        <label>Server Name: <input name="server_name" required></label><br>
+        <label>Choose Game Modes:</label><br>
+        <input type="checkbox" name="modes" value="movie_quote"> Movie Quote<br>
+        <input type="checkbox" name="modes" value="movie_poster"> Zoomed Poster<br>
+        <input type="checkbox" name="modes" value="movie_still"> Still Frame<br>
+        <input type="checkbox" name="modes" value="music_normal"> Music Clip<br>
+        <input type="checkbox" name="modes" value="music_reversed"> Reversed Audio<br>
+        <input type="checkbox" name="modes" value="random"> Random Selection<br>
+        <br>
+        <label>Number of Questions: <input type="number" name="num_questions" min="1" max="50" value="10" required></label><br>
+        <label>Team Mode: <input type="checkbox" name="team_mode"></label><br>
+        <button type="submit">Create Game</button>
+
+    </form>
+</body>
+</html>

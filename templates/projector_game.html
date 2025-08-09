@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Flashback – Projector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  <script src="https://cdn.socket.io/4.3.2/socket.io.min.js"></script>
+</head>
+<body>
+  <header><h1>Flashback – Projector</h1></header>
+  <div class="wrap">
+    <div class="card">
+      <div class="timer">⏳ <span id="timer">--</span> s</div>
+      <div class="question" id="question-text">Waiting for question…</div>
+      <div class="reveal" id="reveal">✅ Correct answer: <span id="correct-answer"></span></div>
+    </div>
+
+    <div class="row" style="margin-top:16px;">
+      <div class="col card answers">
+        <h3>Answers</h3>
+        <ul id="answer-list"></ul>
+      </div>
+      <div class="col card board">
+        <h3>Leaderboard</h3>
+        <ul id="score-list" class="leader"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const socket = io();
+    const gameId = "{{ game_id }}";
+    socket.emit("join_room", { game_id: gameId });
+
+    // Visual countdown only (projector never emits timer_ended)
+    let countdownInterval;
+    function startTimerUI(seconds) {
+      clearInterval(countdownInterval);
+      let t = seconds;
+      document.getElementById("timer").textContent = t;
+      countdownInterval = setInterval(() => {
+        t -= 1;
+        document.getElementById("timer").textContent = t;
+        if (t <= 0) clearInterval(countdownInterval);
+      }, 1000);
+    }
+
+    socket.on("next_question", (data) => {
+      document.getElementById("question-text").textContent = data.question || "";
+      document.getElementById("correct-answer").textContent = "";
+      document.getElementById("reveal").style.display = "none";
+      document.getElementById("answer-list").innerHTML = "";
+    });
+
+    socket.on("start_timer", (duration) => {
+      const secs = typeof duration === "number" ? duration : 30;
+      startTimerUI(secs);
+    });
+
+    socket.on("incoming_answer", (data) => {
+      const li = document.createElement("li");
+      li.textContent = `${data.team}: ${data.answer}`;
+      document.getElementById("answer-list").appendChild(li);
+    });
+
+    socket.on("reveal_answer", (data) => {
+      document.getElementById("correct-answer").textContent = data.correct;
+      document.getElementById("reveal").style.display = "block";
+    });
+
+    socket.on("score_updated", () => {
+      fetch(`/api/game_state/${gameId}`)
+        .then(r => r.json())
+        .then(game => {
+          const ul = document.getElementById("score-list");
+          ul.innerHTML = "";
+          const sorted = Object.entries(game.teams).sort((a,b) => b[1].score - a[1].score);
+          for (const [team, info] of sorted) {
+            const li = document.createElement("li");
+            li.innerHTML = `<span>${team}</span><span>${info.score} pts</span>`;
+            ul.appendChild(li);
+          }
+        });
+    });
+  </script>
+</body>
+</html>

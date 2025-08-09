@@ -1,0 +1,36 @@
+{
+    "code": "CS5XY",
+    "server_name": "vv",
+    "modes": [
+        "movie_quote"
+    ],
+    "team_mode": false,
+    "teams": {
+        "dd": {
+            "score": 1,
+            "answers": []
+        },
+        "ss": {
+            "score": 0,
+            "answers": []
+        }
+    },
+    "questions": [
+        {
+            "question_id": "movie_quote_0",
+            "type": "quote",
+            "data": "I'm the king of the world!",
+            "answer": "Titanic",
+            "answered": []
+        },
+        {
+            "question_id": "movie_quote_1",
+            "type": "quote",
+            "data": "I'm the king of the world!",
+            "answer": "Titanic",
+            "answered": []
+        }
+    ],
+    "current_question": 2,
+    "history": []
+}

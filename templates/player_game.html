@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Play Flashback</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  <script src="https://cdn.socket.io/4.3.2/socket.io.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+    .timer { font-size: 20px; font-weight: 700; color: #b33; }
+    form { margin-top: 10px; display:flex; gap:8px; }
+    input[type="text"] { flex:1; padding:8px; }
+    button { padding:8px 14px; }
+    .muted { color:#777; font-size:14px; margin-top:6px; }
+  </style>
+</head>
+<body>
+  <h1>Flashback – Player</h1>
+  <h2 id="instruction">Waiting for the host to start...</h2>
+  <p class="timer"><strong>Time Left:</strong> <span id="timer">--</span> seconds</p>
+
+  <form id="answer-form">
+    <input type="text" id="answer-input" placeholder="Your answer..." required>
+    <button type="submit" id="submit-btn">Submit</button>
+  </form>
+  <div id="status" class="muted"></div>
+
+  <script>
+    const socket = io();
+    const gameId = "{{ game_id }}";
+    const username = "{{ username }}";
+
+    socket.emit("join_room", { game_id: gameId });
+
+    // One-submission-per-question guard (client-side)
+    let hasSubmittedThisRound = false;
+
+    // Timer logic (player emits timer_ended once when it hits 0)
+    let countdownInterval;
+    let emittedEnd = false;
+
+    function lockInput() {
+      const input = document.getElementById("answer-input");
+      const btn = document.getElementById("submit-btn");
+      if (input) input.disabled = true;
+      if (btn) btn.disabled = true;
+    }
+
+    function unlockInput() {
+      const input = document.getElementById("answer-input");
+      const btn = document.getElementById("submit-btn");
+      if (input) { input.disabled = false; input.value = ""; input.focus(); }
+      if (btn) btn.disabled = false;
+    }
+
+    function startTimer(duration) {
+      clearInterval(countdownInterval);
+      emittedEnd = false;
+      let timeLeft = duration;
+      document.getElementById("timer").textContent = timeLeft;
+
+      countdownInterval = setInterval(() => {
+        timeLeft--;
+        document.getElementById("timer").textContent = timeLeft;
+        if (timeLeft <= 0) {
+          clearInterval(countdownInterval);
+          if (!emittedEnd) {
+            emittedEnd = true;
+            socket.emit("timer_ended", { game_id: gameId });
+          }
+          lockInput();
+          document.getElementById("status").textContent = "Time's up! Waiting for reveal…";
+        }
+      }, 1000);
+    }
+
+    // When host advances to the next question
+    socket.on("next_question", () => {
+      document.getElementById("instruction").textContent = "Look at the board for the next question.";
+      hasSubmittedThisRound = false;
+      unlockInput();
+      document.getElementById("status").textContent = "";
+    });
+
+  socket.on("start_timer", (data) => {
+    console.log("[start_timer] received:", data);
+    clearInterval(countdownInterval);
+    const duration = (data && typeof data.duration === "number") ? data.duration : 30;
+    let timeLeft = duration;
+    document.getElementById("timer").textContent = timeLeft;
+
+    countdownInterval = setInterval(() => {
+      timeLeft--;
+      document.getElementById("timer").textContent = timeLeft;
+      if (timeLeft <= 0) {
+        clearInterval(countdownInterval);
+        // Optionally tell the server the round ended (if host isn’t doing it)
+        // socket.emit("timer_ended", { game_id: gameId });
+      }
+    }, 1000);
+  });
+  </script>
+</body>
+</html>
