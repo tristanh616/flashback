@@ -1,16 +1,41 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Flashback</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
-</head>
-<body>
-    <h1>Welcome to Flashback</h1>
-    <a href="{{ url_for('create') }}">Create Game</a><br>
-    <form action="{{ url_for('join') }}" method="post">
-        <input name="username" placeholder="Username/Team Name" required>
-        <input name="game_id" placeholder="Game Code" required>
-        <button type="submit">Join Game</button>
-    </form>
-</body>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QR Party Game</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+
+  <body>
+    <main class="wrap">
+      <header class="header">
+        <h1>QR Party Game</h1>
+        <p class="sub">
+          Pass-the-phone clue reveal. Pre-generated clues. Fast scanning.
+        </p>
+      </header>
+
+      <section class="card">
+        <h2>Create</h2>
+        <p>
+          Start by generating a card from TMDb or Spotify, or create a manual card
+          and let the AI write the clues.
+        </p>
+        <a class="btn" href="/create">Create a card</a>
+      </section>
+
+      <section class="card">
+        <h2>Important</h2>
+        <ul class="list">
+          <li>
+            If you scan from a phone, make sure <code>BASE_URL</code> points to your PC IP on the same Wi-Fi.
+          </li>
+          <li>
+            Clues are generated once at creation time. Scanning is instant.
+          </li>
+        </ul>
+      </section>
+    </main>
+  </body>
 </html>
