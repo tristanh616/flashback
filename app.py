@@ -5,11 +5,13 @@ import random
 import secrets
 import sqlite3
 from datetime import datetime
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple
+from io import BytesIO
+from urllib.parse import urlparse
 
 import requests
 import qrcode
-from flask import Flask, render_template, redirect, url_for, request, abort
+from flask import Flask, render_template, redirect, url_for, request, abort, send_file
 
 
 # ----------------------------
@@ -17,31 +19,31 @@ from flask import Flask, render_template, redirect, url_for, request, abort
 # ----------------------------
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()  # pick a cheaper model for clue generation
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
 # TMDb
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()  # v3 API key
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 TMDB_LANG = os.getenv("TMDB_LANG", "en-US").strip()
 TMDB_INCLUDE_ADULT = os.getenv("TMDB_INCLUDE_ADULT", "false").strip().lower() == "true"
 
 # Spotify
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-DEFAULT_SPOTIFY_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "").strip()  # optional convenience default
+DEFAULT_SPOTIFY_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "").strip()
 SPOTIFY_MARKET = os.getenv("SPOTIFY_MARKET", "CA").strip()
 
 # App
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(APP_DIR, "game.db")
-QR_DIR = os.path.join(APP_DIR, "static", "qr")
 
-# If you want phone scanning on the same Wi-Fi:
-# Set BASE_URL to your PC IP + port, ex: http://192.168.0.25:5000
-BASE_URL = os.getenv("BASE_URL", "").strip()  # if empty, we'll use request.host_url (works on same device)
+# On Heroku, do not depend on writing to your project directory.
+# /tmp is available, but it is ephemeral. SQLite in /tmp is OK for MVP.
+DB_PATH = os.path.join("/tmp", "game.db")
 
+# If you set BASE_URL, set it to scheme+host only, like:
+# https://flashback-game-f57ef89364fe.herokuapp.com
+BASE_URL = os.getenv("BASE_URL", "").strip()
 
 app = Flask(__name__)
-os.makedirs(QR_DIR, exist_ok=True)
 
 
 # ----------------------------
@@ -64,41 +66,30 @@ def init_db():
                 mode TEXT NOT NULL,              -- "movie" or "music"
                 source TEXT NOT NULL,            -- "tmdb" or "spotify" or "manual"
 
-                answer TEXT NOT NULL,            -- hidden answer shown at step=4
-                meta_json TEXT NOT NULL,         -- JSON metadata about the item
+                answer TEXT NOT NULL,
+                meta_json TEXT NOT NULL,
 
                 clue1 TEXT NOT NULL,
                 clue2 TEXT NOT NULL,
-                clue3 TEXT NOT NULL
+                clue3 TEXT NOT NULL,
+
+                qr_png BLOB NOT NULL             -- QR image bytes stored in DB
             )
             """
         )
         conn.commit()
 
 
+# Make sure schema exists even when running under gunicorn (Heroku).
+init_db()
+
+
 # ----------------------------
 # Utilities
 # ----------------------------
-def make_id(n=6) -> str:
+def make_id(n: int = 6) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(n))
-
-
-def resolve_base_url(req_host_url: str) -> str:
-    if BASE_URL:
-        return BASE_URL.rstrip("/")
-    return req_host_url.strip("/")
-
-
-def make_qr(card_id: str, base_url: str) -> str:
-    """
-    Returns the absolute path of the generated QR PNG on disk.
-    """
-    url = f"{base_url}/c/{card_id}"
-    img = qrcode.make(url)
-    path = os.path.join(QR_DIR, f"{card_id}.png")
-    img.save(path)
-    return path
 
 
 def safe_json_dumps(obj: Any) -> str:
@@ -112,65 +103,76 @@ def safe_json_loads(s: str) -> Any:
         return {}
 
 
+def sanitize_base_url(raw: str) -> str:
+    """
+    Ensures base URL is only scheme://host, never includes /create or other paths.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    p = urlparse(raw)
+    if not p.scheme or not p.netloc:
+        return raw.rstrip("/")  # if user gave something odd, return best effort
+    return f"{p.scheme}://{p.netloc}"
+
+
+def resolve_base_url(req_host_url: str) -> str:
+    """
+    Prefer BASE_URL if set. Otherwise use request.host_url.
+    Always return scheme://host without extra path.
+    """
+    if BASE_URL:
+        return sanitize_base_url(BASE_URL)
+    return sanitize_base_url(req_host_url)
+
+
+def make_qr_png_bytes(url: str) -> bytes:
+    """
+    Generate PNG bytes for a QR code. No filesystem.
+    """
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 # ----------------------------
-# OpenAI (Responses API) clue generation
+# OpenAI clue generation
 # ----------------------------
 def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple[str, str, str]:
-    """
-    Generates 3 clues in a ladder:
-      clue1: broad
-      clue2: narrower
-      clue3: almost giveaway
-    Must not contain the answer text or near-identical forms of it.
-    """
-
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY env var.")
 
-    # Build a compact context the model can use.
-    # For movies we include year, genres, cast, director if available, plot.
-    # For music we include year, artists, album, genres if available.
     meta_compact = {
         "mode": mode,
         "answer": answer,
         "meta": meta,
         "rules": [
             "Return JSON only.",
-            "Produce exactly 3 clues: clue1, clue2, clue3.",
-            "Clues must not include the answer text (title, artist, etc).",
-            "Clue3 can be near-giveaway but still must not directly say the answer.",
-            "Each clue should be 1 short sentence (max ~18 words).",
-            "Avoid quotation marks around the answer.",
+            "Exactly 3 clues: clue1, clue2, clue3.",
+            "Clues must NOT include the answer text or near-identical forms.",
+            "Each clue: one short sentence, max ~18 words.",
+            "Clue difficulty must escalate: broad -> narrower -> almost giveaway.",
         ],
     }
 
-    system = (
-        "You are generating party-game clues. The goal is fun, fair difficulty, and zero spoilers. "
-        "Do not reveal the answer explicitly."
-    )
-
+    system = "You generate party-game clues. Do not reveal the answer explicitly."
     user = (
         "Generate three escalating clues for a QR party guessing game.\n"
-        "Output strict JSON: {\"clue1\":\"...\",\"clue2\":\"...\",\"clue3\":\"...\"}\n"
+        "Output strict JSON only: {\"clue1\":\"...\",\"clue2\":\"...\",\"clue3\":\"...\"}\n"
         f"DATA:\n{safe_json_dumps(meta_compact)}"
     )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        # Keep it stable. You can tune later.
         "temperature": 0.7,
     }
 
-    # Simple retry because sometimes models output stray text.
     last_err = None
     for _ in range(3):
         r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
@@ -180,17 +182,10 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
             continue
 
         data = r.json()
-
-        # Responses API can return content in different shapes; this tries common patterns safely.
-        text = ""
-        try:
-            # Most often: output_text is present
-            text = data.get("output_text", "") or ""
-        except Exception:
-            text = ""
+        text = (data.get("output_text") or "").strip()
 
         if not text:
-            # Fallback: attempt to collect text from output blocks
+            # fallback parsing
             try:
                 output = data.get("output", [])
                 parts = []
@@ -198,11 +193,10 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
                     for c in item.get("content", []):
                         if c.get("type") in ("output_text", "text"):
                             parts.append(c.get("text", ""))
-                text = "\n".join(p for p in parts if p).strip()
+                text = "\n".join([p for p in parts if p]).strip()
             except Exception:
                 text = ""
 
-        # Parse JSON
         try:
             obj = json.loads(text)
             c1 = (obj.get("clue1") or "").strip()
@@ -210,10 +204,11 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
             c3 = (obj.get("clue3") or "").strip()
             if not all([c1, c2, c3]):
                 raise ValueError("Missing clue fields.")
-            # Very basic anti-spoiler check
+
             low_ans = answer.lower()
             if low_ans in c1.lower() or low_ans in c2.lower() or low_ans in c3.lower():
                 raise ValueError("Clue contains answer text.")
+
             return c1, c2, c3
         except Exception as e:
             last_err = e
@@ -239,13 +234,6 @@ def tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
 
 
 def pick_random_tmdb_movie() -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns (answer, meta)
-    answer: movie title (and year embedded in meta)
-    meta: info to help clue generation
-    """
-    # Use discover for filtering/sorting. We'll pick a random page and random result.
-    # Keep it mainstream-ish by popularity, exclude adult unless you explicitly allow.
     page = random.randint(1, 20)
     discover = tmdb_get(
         "/discover/movie",
@@ -265,7 +253,6 @@ def pick_random_tmdb_movie() -> Tuple[str, Dict[str, Any]]:
     release_date = (movie.get("release_date") or "").strip()
     year = release_date[:4] if release_date else ""
 
-    # Get extra details for better clues
     details = tmdb_get(f"/movie/{movie_id}", params={})
     credits = tmdb_get(f"/movie/{movie_id}/credits", params={})
 
@@ -284,7 +271,7 @@ def pick_random_tmdb_movie() -> Tuple[str, Dict[str, Any]]:
             director = crew.get("name") or ""
             break
 
-    answer = title  # Keep answer to title only; year stays in meta.
+    answer = title
     meta = {
         "type": "movie",
         "title": title,
@@ -305,10 +292,6 @@ _SPOTIFY_TOKEN_CACHE = {"token": "", "expires_at": 0}
 
 
 def spotify_get_token() -> str:
-    """
-    Client Credentials Flow.
-    This is enough for many read-only endpoints, including reading public playlists.
-    """
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         raise RuntimeError("Missing SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET env var.")
 
@@ -343,16 +326,9 @@ def spotify_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str,
 
 
 def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns (answer, meta)
-    answer: "Song Title - Artist"
-    meta: info to help clue generation
-    """
     if not playlist_id:
         raise RuntimeError("Missing playlist_id for Spotify track selection.")
 
-    # We fetch up to 100 items from a random offset chunk.
-    # Many playlists are smaller. We do two calls: first to get total, then pick offset.
     first = spotify_get(f"/playlists/{playlist_id}/tracks", params={"market": SPOTIFY_MARKET, "limit": 1, "offset": 0})
     total = int(first.get("total") or 0)
     if total <= 0:
@@ -371,11 +347,7 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
     tracks = []
     for it in items:
         t = (it.get("track") or {})
-        if not t:
-            continue
-        if t.get("type") != "track":
-            continue
-        if t.get("is_local"):
+        if not t or t.get("type") != "track" or t.get("is_local"):
             continue
         name = (t.get("name") or "").strip()
         artists = [a.get("name") for a in (t.get("artists") or []) if a.get("name")]
@@ -393,7 +365,6 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
     release_date = ((t.get("album") or {}).get("release_date") or "").strip()
     year = release_date[:4] if release_date else ""
 
-    # Answer format: Song - Artist (first artist)
     answer = f"{name} - {artists[0]}"
 
     meta = {
@@ -404,7 +375,6 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
         "year": year,
         "spotify_id": t.get("id"),
         "preview_url": t.get("preview_url"),
-        # External URLs can help in admin view, not needed for clue gen
         "external_url": ((t.get("external_urls") or {}).get("spotify") or ""),
     }
     return answer, meta
@@ -414,20 +384,20 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
 # Card creation
 # ----------------------------
 def create_card(mode: str, source: str, answer: str, meta: Dict[str, Any], base_url: str) -> str:
-    """
-    Creates a DB record + QR, returns card_id
-    """
-    # Generate clues (pre-gen)
     c1, c2, c3 = openai_generate_clues(mode=mode, answer=answer, meta=meta)
 
     card_id = make_id()
     created_at = datetime.utcnow().isoformat()
 
+    # QR URL points to /c/<id> and MUST NOT point to /create
+    scan_url = f"{base_url}/c/{card_id}"
+    qr_bytes = make_qr_png_bytes(scan_url)
+
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO cards (id, created_at, mode, source, answer, meta_json, clue1, clue2, clue3)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cards (id, created_at, mode, source, answer, meta_json, clue1, clue2, clue3, qr_png)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 card_id,
@@ -439,11 +409,11 @@ def create_card(mode: str, source: str, answer: str, meta: Dict[str, Any], base_
                 c1,
                 c2,
                 c3,
+                sqlite3.Binary(qr_bytes),
             ),
         )
         conn.commit()
 
-    make_qr(card_id, base_url)
     return card_id
 
 
@@ -452,31 +422,16 @@ def create_card(mode: str, source: str, answer: str, meta: Dict[str, Any], base_
 # ----------------------------
 @app.route("/")
 def index():
-    """
-    Minimal home. Your templates can show buttons:
-      - Create random TMDb movie card
-      - Create random Spotify playlist track card
-      - Manual fallback
-    """
     return render_template("index.html")
 
 
 @app.route("/create", methods=["GET", "POST"])
 def create():
-    """
-    One unified create endpoint.
-    GET: shows a form (your HTML decides the UI)
-    POST: chooses source:
-      - tmdb_random_movie
-      - spotify_random_from_playlist
-      - manual
-    """
     if request.method == "GET":
         return render_template("create.html", default_playlist_id=DEFAULT_SPOTIFY_PLAYLIST_ID)
 
     kind = (request.form.get("kind") or "").strip()
-    req_host = request.host_url
-    base_url = resolve_base_url(req_host)
+    base_url = resolve_base_url(request.host_url)
 
     try:
         if kind == "tmdb_random_movie":
@@ -489,13 +444,11 @@ def create():
             mode = "music"
             playlist_id = (request.form.get("playlist_id") or DEFAULT_SPOTIFY_PLAYLIST_ID).strip()
             answer, meta = pick_random_spotify_track_from_playlist(playlist_id)
-            # Store playlist_id for traceability
             meta["playlist_id"] = playlist_id
             card_id = create_card(mode=mode, source="spotify", answer=answer, meta=meta, base_url=base_url)
             return redirect(url_for("card_admin", card_id=card_id))
 
         if kind == "manual":
-            # Manual answer, AI-generated clues from minimal meta
             mode = (request.form.get("mode") or "movie").strip()
             answer = (request.form.get("answer") or "").strip()
             if not answer:
@@ -504,31 +457,27 @@ def create():
             card_id = create_card(mode=mode, source="manual", answer=answer, meta=meta, base_url=base_url)
             return redirect(url_for("card_admin", card_id=card_id))
 
-        return "Unknown kind. Expected tmdb_random_movie, spotify_random_from_playlist, or manual.", 400
+        return "Unknown kind.", 400
 
     except Exception as e:
-        # In a real app you'd render a friendly error page.
         return f"Create failed: {type(e).__name__}: {e}", 500
 
 
 @app.route("/admin/<card_id>")
 def card_admin(card_id):
-    """
-    Host view for printing/testing.
-    """
     with db() as conn:
         row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
     if not row:
         abort(404)
 
     meta = safe_json_loads(row["meta_json"])
-    qr_path = f"/static/qr/{card_id}.png"
+    base_url = resolve_base_url(request.host_url)
 
-    # Plain JSON response (easy debugging). You can swap to render_template if you prefer.
+    # IMPORTANT: qr_image is now served from the DB route, not /static/qr/
     return {
         "card_id": card_id,
-        "qr_image": qr_path,
-        "scan_url": f"{resolve_base_url(request.host_url)}/c/{card_id}",
+        "qr_image": f"{base_url}/qr/{card_id}.png",
+        "scan_url": f"{base_url}/c/{card_id}",
         "mode": row["mode"],
         "source": row["source"],
         "answer": row["answer"],
@@ -537,14 +486,26 @@ def card_admin(card_id):
     }
 
 
+@app.route("/qr/<card_id>.png")
+def qr_png(card_id):
+    """
+    Serve the QR image stored in the DB.
+    This fixes 'I can't find the image' on Heroku permanently.
+    """
+    with db() as conn:
+        row = conn.execute("SELECT qr_png FROM cards WHERE id = ?", (card_id,)).fetchone()
+    if not row:
+        abort(404)
+
+    data = row["qr_png"]
+    if not data:
+        abort(404)
+
+    return send_file(BytesIO(data), mimetype="image/png", download_name=f"{card_id}.png")
+
+
 @app.route("/c/<card_id>")
 def card_view(card_id):
-    """
-    Player-facing:
-      step=0 -> show nothing
-      step=1..3 -> show ONLY the current clue (no previous)
-      step=4 -> show answer
-    """
     with db() as conn:
         row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
     if not row:
@@ -567,13 +528,6 @@ def card_view(card_id):
     elif step == 4:
         reveal_answer = True
 
-    # Your card.html must use:
-    # - mode
-    # - step
-    # - current_clue
-    # - reveal_answer
-    # - answer
-    # - card_id
     return render_template(
         "card.html",
         mode=row["mode"],
@@ -584,15 +538,6 @@ def card_view(card_id):
         card_id=card_id,
     )
 
-@app.route("/_initdb")
-def initdb_route():
-    init_db()
-    return "DB initialized. cards table created (if missing)."
 
-
-# ----------------------------
-# Entry
-# ----------------------------
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True)
