@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import requests
 import qrcode
+from PIL import Image
 from flask import Flask, render_template, redirect, url_for, request, abort, send_file
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -123,10 +124,36 @@ def resolve_base_url(req_host_url: str) -> str:
     return sanitize_base_url(req_host_url)
 
 def make_qr_png_bytes(url: str) -> bytes:
-    img = qrcode.make(url)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    bg_path = "static/qr/qr_bg_927x597.png"
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=8,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGBA")
+
+    bg = Image.open(bg_path).convert("RGBA")
+
+    if bg.size != (927, 597):
+        raise RuntimeError(f"QR background must be 927x597, got {bg.size}")
+
+    qr_size = 220
+    x = 927 - qr_size - 40
+    y = 597 - qr_size - 40
+
+    qr_img = qr_img.resize((qr_size, qr_size), Image.NEAREST)
+    bg.alpha_composite(qr_img, (x, y))
+
+    out = BytesIO()
+    bg.save(out, format="PNG")
+    return out.getvalue()
+
+
 
 def clamp_players(value: str) -> int:
     try:
@@ -705,17 +732,22 @@ def card_admin(card_id):
     if not isinstance(clues, list):
         clues = []
 
-    return {
-        "card_id": card_id,
-        "players": int(row["players"] or 4),
-        "qr_image": f"{base_url}/qr/{card_id}.png",
-        "scan_url": f"{base_url}/c/{card_id}",
-        "mode": row["mode"],
-        "source": row["source"],
-        "answer": row["answer"],
-        "clues": clues,
-        "meta": meta,
-    }
+    scan_url = f"{base_url}/c/{card_id}"
+    qr_url = f"{base_url}/qr/{card_id}.png"
+
+    return render_template(
+        "admin.html",
+        card_id=card_id,
+        players=int(row["players"] or 4),
+        mode=row["mode"],
+        source=row["source"],
+        answer=row["answer"],
+        clues=clues,
+        meta=meta,
+        scan_url=scan_url,
+        qr_url=qr_url,
+    )
+
 
 @app.route("/qr/<card_id>.png")
 def qr_png(card_id):
