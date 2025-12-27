@@ -584,6 +584,11 @@ def card_view(card_id):
         card_id=card_id,
     )
 
+@app.route("/_initdb")
+def initdb_route():
+    init_db()
+    return "DB initialized. cards table created (if missing)."
+
 
 # ----------------------------
 # Entry
