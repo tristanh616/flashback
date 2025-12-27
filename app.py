@@ -35,13 +35,17 @@ SPOTIFY_MARKET = os.getenv("SPOTIFY_MARKET", "CA").strip()
 # App
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# On Heroku, do not depend on writing to your project directory.
-# /tmp is available, but it is ephemeral. SQLite in /tmp is OK for MVP.
+# Heroku-friendly: do not depend on writing to your repo directory.
 DB_PATH = os.path.join("/tmp", "game.db")
 
-# If you set BASE_URL, set it to scheme+host only, like:
-# https://flashback-game-f57ef89364fe.herokuapp.com
+# If you set BASE_URL, use scheme+host only: https://your-app.herokuapp.com
 BASE_URL = os.getenv("BASE_URL", "").strip()
+
+# Timer tuning
+BASE_TIMER_SECONDS = int(os.getenv("BASE_TIMER_SECONDS", "8"))
+
+# Clue constraints
+MAX_CLUE_WORDS = int(os.getenv("MAX_CLUE_WORDS", "8"))
 
 app = Flask(__name__)
 
@@ -65,6 +69,7 @@ def init_db():
 
                 mode TEXT NOT NULL,              -- "movie" or "music"
                 source TEXT NOT NULL,            -- "tmdb" or "spotify" or "manual"
+                players INTEGER NOT NULL DEFAULT 4,
 
                 answer TEXT NOT NULL,
                 meta_json TEXT NOT NULL,
@@ -77,10 +82,17 @@ def init_db():
             )
             """
         )
+
+        # Migration for older DBs
+        try:
+            conn.execute("ALTER TABLE cards ADD COLUMN players INTEGER NOT NULL DEFAULT 4")
+        except sqlite3.OperationalError:
+            pass
+
         conn.commit()
 
 
-# Make sure schema exists even when running under gunicorn (Heroku).
+# Ensure schema exists under gunicorn
 init_db()
 
 
@@ -104,36 +116,51 @@ def safe_json_loads(s: str) -> Any:
 
 
 def sanitize_base_url(raw: str) -> str:
-    """
-    Ensures base URL is only scheme://host, never includes /create or other paths.
-    """
     raw = (raw or "").strip()
     if not raw:
         return ""
     p = urlparse(raw)
     if not p.scheme or not p.netloc:
-        return raw.rstrip("/")  # if user gave something odd, return best effort
+        return raw.rstrip("/")
     return f"{p.scheme}://{p.netloc}"
 
 
 def resolve_base_url(req_host_url: str) -> str:
-    """
-    Prefer BASE_URL if set. Otherwise use request.host_url.
-    Always return scheme://host without extra path.
-    """
     if BASE_URL:
         return sanitize_base_url(BASE_URL)
     return sanitize_base_url(req_host_url)
 
 
 def make_qr_png_bytes(url: str) -> bytes:
-    """
-    Generate PNG bytes for a QR code. No filesystem.
-    """
     img = qrcode.make(url)
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def clamp_players(value: str) -> int:
+    try:
+        p = int((value or "4").strip())
+    except ValueError:
+        p = 4
+    return max(2, min(p, 12))
+
+
+def timer_for_players(players: int) -> int:
+    p = max(2, min(players, 12))
+
+    if p <= 2:
+        return max(5, BASE_TIMER_SECONDS - 1)
+    if p <= 4:
+        return BASE_TIMER_SECONDS
+    if p <= 6:
+        return BASE_TIMER_SECONDS + 1
+    return BASE_TIMER_SECONDS + 2
+
+
+def clamp_words(s: str, max_words: int) -> str:
+    parts = (s or "").strip().split()
+    return " ".join(parts[:max_words])
 
 
 # ----------------------------
@@ -151,12 +178,14 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
             "Return JSON only.",
             "Exactly 3 clues: clue1, clue2, clue3.",
             "Clues must NOT include the answer text or near-identical forms.",
-            "Each clue: one short sentence, max ~18 words.",
+            f"Each clue must be at most {MAX_CLUE_WORDS} words.",
+            "Prefer keywords, not full sentences.",
+            "No commas. No semicolons. No parentheses.",
             "Clue difficulty must escalate: broad -> narrower -> almost giveaway.",
         ],
     }
 
-    system = "You generate party-game clues. Do not reveal the answer explicitly."
+    system = "You generate short party-game clues. Never reveal the answer."
     user = (
         "Generate three escalating clues for a QR party guessing game.\n"
         "Output strict JSON only: {\"clue1\":\"...\",\"clue2\":\"...\",\"clue3\":\"...\"}\n"
@@ -170,7 +199,7 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0.7,
+        "temperature": 0.4,
     }
 
     last_err = None
@@ -185,7 +214,6 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
         text = (data.get("output_text") or "").strip()
 
         if not text:
-            # fallback parsing
             try:
                 output = data.get("output", [])
                 parts = []
@@ -199,9 +227,10 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any]) -> Tuple
 
         try:
             obj = json.loads(text)
-            c1 = (obj.get("clue1") or "").strip()
-            c2 = (obj.get("clue2") or "").strip()
-            c3 = (obj.get("clue3") or "").strip()
+            c1 = clamp_words((obj.get("clue1") or "").strip(), MAX_CLUE_WORDS)
+            c2 = clamp_words((obj.get("clue2") or "").strip(), MAX_CLUE_WORDS)
+            c3 = clamp_words((obj.get("clue3") or "").strip(), MAX_CLUE_WORDS)
+
             if not all([c1, c2, c3]):
                 raise ValueError("Missing clue fields.")
 
@@ -376,6 +405,7 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
         "spotify_id": t.get("id"),
         "preview_url": t.get("preview_url"),
         "external_url": ((t.get("external_urls") or {}).get("spotify") or ""),
+        "playlist_id": playlist_id,
     }
     return answer, meta
 
@@ -383,27 +413,27 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> Tuple[str, Dict
 # ----------------------------
 # Card creation
 # ----------------------------
-def create_card(mode: str, source: str, answer: str, meta: Dict[str, Any], base_url: str) -> str:
+def create_card(mode: str, source: str, players: int, answer: str, meta: Dict[str, Any], base_url: str) -> str:
     c1, c2, c3 = openai_generate_clues(mode=mode, answer=answer, meta=meta)
 
     card_id = make_id()
     created_at = datetime.utcnow().isoformat()
 
-    # QR URL points to /c/<id> and MUST NOT point to /create
     scan_url = f"{base_url}/c/{card_id}"
     qr_bytes = make_qr_png_bytes(scan_url)
 
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO cards (id, created_at, mode, source, answer, meta_json, clue1, clue2, clue3, qr_png)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cards (id, created_at, mode, source, players, answer, meta_json, clue1, clue2, clue3, qr_png)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 card_id,
                 created_at,
                 mode,
                 source,
+                players,
                 answer,
                 safe_json_dumps(meta),
                 c1,
@@ -431,21 +461,21 @@ def create():
         return render_template("create.html", default_playlist_id=DEFAULT_SPOTIFY_PLAYLIST_ID)
 
     kind = (request.form.get("kind") or "").strip()
+    players = clamp_players(request.form.get("players") or "4")
     base_url = resolve_base_url(request.host_url)
 
     try:
         if kind == "tmdb_random_movie":
             mode = "movie"
             answer, meta = pick_random_tmdb_movie()
-            card_id = create_card(mode=mode, source="tmdb", answer=answer, meta=meta, base_url=base_url)
+            card_id = create_card(mode=mode, source="tmdb", players=players, answer=answer, meta=meta, base_url=base_url)
             return redirect(url_for("card_admin", card_id=card_id))
 
         if kind == "spotify_random_from_playlist":
             mode = "music"
             playlist_id = (request.form.get("playlist_id") or DEFAULT_SPOTIFY_PLAYLIST_ID).strip()
             answer, meta = pick_random_spotify_track_from_playlist(playlist_id)
-            meta["playlist_id"] = playlist_id
-            card_id = create_card(mode=mode, source="spotify", answer=answer, meta=meta, base_url=base_url)
+            card_id = create_card(mode=mode, source="spotify", players=players, answer=answer, meta=meta, base_url=base_url)
             return redirect(url_for("card_admin", card_id=card_id))
 
         if kind == "manual":
@@ -454,7 +484,7 @@ def create():
             if not answer:
                 return "Missing answer.", 400
             meta = {"type": mode, "note": "manual_entry"}
-            card_id = create_card(mode=mode, source="manual", answer=answer, meta=meta, base_url=base_url)
+            card_id = create_card(mode=mode, source="manual", players=players, answer=answer, meta=meta, base_url=base_url)
             return redirect(url_for("card_admin", card_id=card_id))
 
         return "Unknown kind.", 400
@@ -473,9 +503,9 @@ def card_admin(card_id):
     meta = safe_json_loads(row["meta_json"])
     base_url = resolve_base_url(request.host_url)
 
-    # IMPORTANT: qr_image is now served from the DB route, not /static/qr/
     return {
         "card_id": card_id,
+        "players": int(row["players"] or 4),
         "qr_image": f"{base_url}/qr/{card_id}.png",
         "scan_url": f"{base_url}/c/{card_id}",
         "mode": row["mode"],
@@ -488,10 +518,6 @@ def card_admin(card_id):
 
 @app.route("/qr/<card_id>.png")
 def qr_png(card_id):
-    """
-    Serve the QR image stored in the DB.
-    This fixes 'I can't find the image' on Heroku permanently.
-    """
     with db() as conn:
         row = conn.execute("SELECT qr_png FROM cards WHERE id = ?", (card_id,)).fetchone()
     if not row:
@@ -516,8 +542,10 @@ def card_view(card_id):
         step = int(step_str)
     except ValueError:
         step = 0
-
     step = max(0, min(step, 4))
+
+    players = int(row["players"] or 4)
+    timer_seconds = timer_for_players(players)
 
     clues = [row["clue1"], row["clue2"], row["clue3"]]
     current_clue = None
@@ -536,6 +564,8 @@ def card_view(card_id):
         reveal_answer=reveal_answer,
         answer=row["answer"],
         card_id=card_id,
+        timer_seconds=timer_seconds,
+        players=players,
     )
 
 

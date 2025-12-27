@@ -11,33 +11,59 @@
     <main class="wrap">
       <header class="header">
         <h1>{{ "Movie/Show" if mode == "movie" else "Music" }} Card</h1>
-        <p class="sub">Pass the phone. Tap once per reveal.</p>
+        <p class="sub">Tap to reveal. Timer forces a clean pass.</p>
       </header>
 
       <section class="card center">
         {% if current_clue %}
           <div class="pill">Clue {{ step }} / 3</div>
           <p class="big">{{ current_clue }}</p>
+
+          <p class="hint">
+            Time left: <strong id="countdown">{{ timer_seconds }}</strong>s
+          </p>
+
+          <script>
+            (function () {
+              var seconds = Number(document.getElementById("countdown").textContent) || 8;
+              var el = document.getElementById("countdown");
+
+              var t = setInterval(function () {
+                seconds -= 1;
+                if (seconds <= 0) {
+                  clearInterval(t);
+                  window.location.href = "/c/{{ card_id }}?step=0";
+                  return;
+                }
+                el.textContent = String(seconds);
+              }, 1000);
+            })();
+          </script>
+
         {% elif reveal_answer %}
           <div class="pill">Answer</div>
           <p class="big"><strong>{{ answer }}</strong></p>
+          <div class="actions">
+            <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
+          </div>
+
         {% else %}
           <div class="pill">Ready</div>
-          <p class="big">No clue revealed yet.</p>
+          <p class="big">Pass the phone. Tap when ready.</p>
+
+          <div class="actions">
+            {% if step < 3 %}
+              <a class="btn" href="/c/{{ card_id }}?step={{ step + 1 }}">Reveal next clue</a>
+            {% elif step == 3 %}
+              <a class="btn" href="/c/{{ card_id }}?step=4">Reveal answer</a>
+            {% else %}
+              <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
+            {% endif %}
+          </div>
         {% endif %}
 
-        <div class="actions">
-          {% if step < 3 %}
-            <a class="btn" href="/c/{{ card_id }}?step={{ step + 1 }}">Next clue</a>
-          {% elif step == 3 %}
-            <a class="btn" href="/c/{{ card_id }}?step=4">Reveal answer</a>
-          {% else %}
-            <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
-          {% endif %}
-        </div>
-
         <p class="hint">
-          Rule suggestion: once someone taps “Next clue”, they must pass the phone immediately.
+          Rule: once revealed, read it silently, then pass when it auto-hides.
         </p>
       </section>
     </main>

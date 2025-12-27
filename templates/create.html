@@ -11,17 +11,34 @@
     <main class="wrap">
       <header class="header">
         <h1>Create a Card</h1>
-        <p class="sub">This will pre-generate clues and produce a QR code.</p>
+        <p class="sub">Choose players, generate a card, scan the QR, pass the phone.</p>
       </header>
 
       <section class="grid">
+        <!-- TMDb -->
         <form class="card" method="post" action="/create">
           <h2>Random Movie (TMDb)</h2>
-          <p>Generates a random popular movie and creates 3 clues.</p>
+          <p>Generates a random popular movie and creates 3 short clues.</p>
+
           <input type="hidden" name="kind" value="tmdb_random_movie" />
+
+          <label class="label">
+            Players (2 to 12)
+            <input
+              class="input"
+              name="players"
+              type="number"
+              min="2"
+              max="12"
+              value="4"
+              required
+            />
+          </label>
+
           <button class="btn" type="submit">Generate TMDb Movie Card</button>
         </form>
 
+        <!-- Spotify -->
         <form class="card" method="post" action="/create">
           <h2>Random Track (Spotify Playlist)</h2>
           <p>Pick a random track from a playlist ID you provide.</p>
@@ -39,16 +56,30 @@
             />
           </label>
 
+          <label class="label">
+            Players (2 to 12)
+            <input
+              class="input"
+              name="players"
+              type="number"
+              min="2"
+              max="12"
+              value="4"
+              required
+            />
+          </label>
+
           <button class="btn" type="submit">Generate Spotify Track Card</button>
 
           <p class="hint">
-            Tip: using one curated family-friendly playlist is smarter than letting Spotify pick from anywhere.
+            Tip: use one curated playlist to avoid weird picks.
           </p>
         </form>
 
+        <!-- Manual -->
         <form class="card" method="post" action="/create">
           <h2>Manual Answer (AI Clues)</h2>
-          <p>You choose the answer. The AI generates the clues.</p>
+          <p>You choose the answer. The AI generates short clues.</p>
 
           <input type="hidden" name="kind" value="manual" />
 
@@ -70,10 +101,23 @@
             />
           </label>
 
+          <label class="label">
+            Players (2 to 12)
+            <input
+              class="input"
+              name="players"
+              type="number"
+              min="2"
+              max="12"
+              value="4"
+              required
+            />
+          </label>
+
           <button class="btn" type="submit">Generate Manual Card</button>
 
           <p class="hint">
-            Warning: if you type the answer poorly (typos, missing artist), clue quality drops.
+            If you type the answer badly, the clues get worse.
           </p>
         </form>
       </section>
