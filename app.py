@@ -4,6 +4,7 @@ import time
 import random
 import secrets
 import sqlite3
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from io import BytesIO
@@ -29,13 +30,17 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEFAULT_SPOTIFY_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "").strip()
 SPOTIFY_MARKET = os.getenv("SPOTIFY_MARKET", "CA").strip()
 
+# Heroku note: /tmp can be wiped on dyno restart. OK for family MVP.
 DB_PATH = os.path.join("/tmp", "game.db")
+
+# Optional: set BASE_URL like https://your-app.herokuapp.com
 BASE_URL = os.getenv("BASE_URL", "").strip()
 
 BASE_TIMER_SECONDS = int(os.getenv("BASE_TIMER_SECONDS", "8"))
 MAX_CLUE_WORDS = int(os.getenv("MAX_CLUE_WORDS", "8"))
 
 app = Flask(__name__)
+
 
 # ----------------------------
 # Database
@@ -44,6 +49,17 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def safe_json_loads(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
 
 
 def init_db():
@@ -67,27 +83,21 @@ def init_db():
             """
         )
 
-        # Inspect existing columns to migrate older schemas.
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(cards)").fetchall()]
         cols_set = set(cols)
 
-        # Ensure players exists (older versions may not have it)
         if "players" not in cols_set:
             conn.execute("ALTER TABLE cards ADD COLUMN players INTEGER NOT NULL DEFAULT 4")
             cols_set.add("players")
 
-        # If migrating from the older schema that had clue1/2/3:
         if "clues_json" not in cols_set:
             conn.execute("ALTER TABLE cards ADD COLUMN clues_json TEXT NOT NULL DEFAULT '[]'")
             cols_set.add("clues_json")
 
-        # Backfill clues_json from clue1/2/3 if those columns exist
+        # Backfill from old schema if it exists
         if {"clue1", "clue2", "clue3"}.issubset(cols_set):
             rows = conn.execute(
-                """
-                SELECT id, clue1, clue2, clue3, clues_json
-                FROM cards
-                """
+                "SELECT id, clue1, clue2, clue3, clues_json FROM cards"
             ).fetchall()
 
             for row in rows:
@@ -97,7 +107,6 @@ def init_db():
                 except Exception:
                     parsed = []
 
-                # Only backfill if it's empty or invalid
                 if not isinstance(parsed, list) or len(parsed) == 0:
                     clues = [row["clue1"], row["clue2"], row["clue3"]]
                     clues = [c for c in clues if c]
@@ -109,6 +118,8 @@ def init_db():
         conn.commit()
 
 
+init_db()
+
 
 # ----------------------------
 # Utilities
@@ -116,17 +127,6 @@ def init_db():
 def make_id(n: int = 6) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(n))
-
-
-def safe_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
-def safe_json_loads(s: str) -> Any:
-    try:
-        return json.loads(s)
-    except Exception:
-        return {}
 
 
 def sanitize_base_url(raw: str) -> str:
@@ -186,47 +186,101 @@ def clamp_words(s: str, max_words: int) -> str:
 
 
 # ----------------------------
-# OpenAI clue generation
+# Answer leak detection
+# ----------------------------
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "from", "by", "at",
+    "is", "it", "this", "that", "as", "are"
+}
+
+
+def normalize_tokens(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    toks = [t for t in s.split() if t and t not in STOP_WORDS]
+    return toks
+
+
+def clue_leaks_answer(answer: str, clue: str, mode: str) -> bool:
+    a = (answer or "").strip()
+    c = (clue or "").strip()
+    if not a or not c:
+        return False
+
+    # Always block full exact substring match
+    if a.lower() in c.lower():
+        return True
+
+    # Music answer convention: "Track - Artist"
+    if mode == "music" and " - " in a:
+        track, artist = a.split(" - ", 1)
+        track_toks = set(normalize_tokens(track))
+        artist_toks = set(normalize_tokens(artist))
+        clue_toks = set(normalize_tokens(c))
+
+        # If clue contains 2+ meaningful tokens from track or artist, treat as leak
+        if len(track_toks) >= 2 and len(track_toks & clue_toks) >= 2:
+            return True
+        if len(artist_toks) >= 2 and len(artist_toks & clue_toks) >= 2:
+            return True
+
+        # Also block exact track phrase if present
+        if track.strip() and track.lower() in c.lower():
+            return True
+
+        return False
+
+    # Movies/shows/manual: treat answer as title
+    title_toks = set(normalize_tokens(a))
+    clue_toks = set(normalize_tokens(c))
+
+    if len(title_toks) <= 2:
+        # Short titles need strict handling
+        if len(title_toks & clue_toks) >= 1 and len(title_toks) >= 1:
+            return True
+        return False
+
+    # Longer titles: leak if 3+ meaningful tokens appear
+    if len(title_toks & clue_toks) >= 3:
+        return True
+
+    return False
+
+
+# ----------------------------
+# OpenAI clue generation (robust)
 # ----------------------------
 def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues: int) -> List[str]:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY env var.")
 
     n_clues = max(3, min(n_clues, 6))
-
     system = "You generate short party-game clues. Never reveal the answer."
-    user = (
-        "Generate escalating clues for a QR party guessing game.\n"
-        "Return strict JSON only in this exact format:\n"
-        "{\"clues\":[\"...\",\"...\"]}\n"
-        "Rules:\n"
-        f"- Exactly {n_clues} clues\n"
-        f"- Each clue max {MAX_CLUE_WORDS} words\n"
-        "- Prefer keywords, not sentences\n"
-        "- No commas, no semicolons, no parentheses\n"
-        "- Do not include the answer text\n\n"
-        f"MODE: {mode}\n"
-        f"ANSWER (do not reveal): {answer}\n"
-        f"META: {safe_json_dumps(meta)}\n"
-    )
+
+    def build_user_prompt(extra_rule: str) -> str:
+        return (
+            "Generate escalating clues for a QR party guessing game.\n"
+            "Return strict JSON only in this exact format:\n"
+            "{\"clues\":[\"...\",\"...\"]}\n"
+            "Rules:\n"
+            f"- Exactly {n_clues} clues\n"
+            f"- Each clue max {MAX_CLUE_WORDS} words\n"
+            "- Prefer keywords, not sentences\n"
+            "- No commas, no semicolons, no parentheses\n"
+            "- Do not include the answer text\n"
+            f"{extra_rule}\n"
+            f"MODE: {mode}\n"
+            f"ANSWER (do not reveal): {answer}\n"
+            f"META: {safe_json_dumps(meta)}\n"
+        )
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.4,
-    }
 
     def extract_text(resp_json: Dict[str, Any]) -> str:
-        # Most common:
         t = (resp_json.get("output_text") or "").strip()
         if t:
             return t
 
-        # Fallback: traverse output blocks
         out = resp_json.get("output") or []
         parts: List[str] = []
         for item in out:
@@ -238,32 +292,33 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
         return "\n".join(parts).strip()
 
     def try_parse_json(text: str) -> Dict[str, Any]:
-        # Strict
         try:
             return json.loads(text)
         except Exception:
             pass
 
-        # Recover if model added extra text around JSON
-        # Find first '{' and last '}' and try that substring.
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            snippet = text[start : end + 1]
-            return json.loads(snippet)
+            return json.loads(text[start:end + 1])
 
         raise ValueError("No JSON object found in model output.")
 
     last_err = None
     last_preview = ""
+    extra_rule = ""
 
-    for _ in range(3):
-        r = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
+    for attempt in range(4):
+        payload = {
+            "model": OPENAI_MODEL,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": build_user_prompt(extra_rule)},
+            ],
+            "temperature": 0.4,
+        }
+
+        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
 
         if r.status_code >= 400:
             last_err = RuntimeError(f"OpenAI error {r.status_code}: {r.text[:500]}")
@@ -276,34 +331,35 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
 
         try:
             obj = try_parse_json(text)
-
             clues = obj.get("clues")
+
             if not isinstance(clues, list) or len(clues) != n_clues:
-                raise ValueError("Wrong JSON shape. Expected {'clues':[...]} with correct length.")
+                raise ValueError("Wrong JSON shape or wrong clue count.")
 
             cleaned: List[str] = []
-            low_ans = answer.lower()
-
             for c in clues:
                 c = clamp_words(str(c).strip(), MAX_CLUE_WORDS)
                 if not c:
                     raise ValueError("Empty clue.")
-                if low_ans in c.lower():
-                    raise ValueError("Clue contains answer text.")
+                if clue_leaks_answer(answer, c, mode):
+                    raise ValueError("LEAK")
                 cleaned.append(c)
 
             return cleaned
 
         except Exception as e:
             last_err = e
+
+            # If leak, tighten prompt and try again
+            if str(e) == "LEAK":
+                extra_rule = "- Extra rule: do not use names from the title. Avoid character names. Avoid proper nouns that match the answer.\n"
             time.sleep(0.6)
 
     raise RuntimeError(f"Failed to generate clues. Last output preview: {last_preview}. Last error: {last_err}")
 
 
-
 # ----------------------------
-# TMDb
+# TMDb helpers
 # ----------------------------
 def tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not TMDB_API_KEY:
@@ -370,7 +426,7 @@ def pick_random_tmdb_movie() -> (str, Dict[str, Any]):
 
 
 # ----------------------------
-# Spotify
+# Spotify helpers
 # ----------------------------
 _SPOTIFY_TOKEN_CACHE = {"token": "", "expires_at": 0}
 
@@ -468,7 +524,15 @@ def pick_random_spotify_track_from_playlist(playlist_id: str) -> (str, Dict[str,
 # ----------------------------
 def create_card(mode: str, source: str, players: int, answer: str, meta: Dict[str, Any], base_url: str) -> str:
     n_clues = clue_count_for_players(players)
-    clues = openai_generate_clues(mode=mode, answer=answer, meta=meta, n_clues=n_clues)
+
+    try:
+        clues = openai_generate_clues(mode=mode, answer=answer, meta=meta, n_clues=n_clues)
+    except Exception:
+        # Hard fallback so your game still works
+        if mode == "movie":
+            clues = ["popular title", "genre hint", "famous cast", "director clue", "iconic scenes"][:n_clues]
+        else:
+            clues = ["popular track", "genre vibe", "well known artist", "hit era", "catchy hook"][:n_clues]
 
     card_id = make_id()
     created_at = datetime.utcnow().isoformat()
@@ -590,7 +654,6 @@ def card_view(card_id):
     if not row:
         abort(404)
 
-    # step is progress: 0 means none shown yet, 1 means clue1 already used, etc
     step_str = request.args.get("step", "0")
     try:
         step = int(step_str)
@@ -598,7 +661,6 @@ def card_view(card_id):
         step = 0
     step = max(0, min(step, 99))
 
-    # show=1 means display clue now, show=0 means hide clue and show ready screen
     show = (request.args.get("show", "0").strip() == "1")
 
     players = int(row["players"] or 4)
@@ -607,17 +669,7 @@ def card_view(card_id):
     clues = safe_json_loads(row["clues_json"])
     if not isinstance(clues, list) or not clues:
         clues = []
-
     total_clues = len(clues)
-
-    # Display logic:
-    # Ready screen:
-    # - if step < total_clues: next reveal is step+1 with show=1
-    # - if step == total_clues: reveal answer with show=1 and step=total_clues+1
-    #
-    # Show screen:
-    # - if 1 <= step <= total_clues: show clue[step-1], then timer redirects to ready show=0 keeping step
-    # - if step == total_clues+1: show answer
 
     current_clue = None
     reveal_answer = False
