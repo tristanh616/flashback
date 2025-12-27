@@ -195,17 +195,16 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
     n_clues = max(3, min(n_clues, 6))
 
     system = "You generate short party-game clues. Never reveal the answer."
-
     user = (
         "Generate escalating clues for a QR party guessing game.\n"
-        f"Return strict JSON only in this exact format:\n"
-        f'{{"clues":["...","..."]}}\n'
-        f"Rules:\n"
+        "Return strict JSON only in this exact format:\n"
+        "{\"clues\":[\"...\",\"...\"]}\n"
+        "Rules:\n"
         f"- Exactly {n_clues} clues\n"
         f"- Each clue max {MAX_CLUE_WORDS} words\n"
-        f"- Prefer keywords, not sentences\n"
-        f"- No commas, no semicolons, no parentheses\n"
-        f"- Do not include the answer text\n\n"
+        "- Prefer keywords, not sentences\n"
+        "- No commas, no semicolons, no parentheses\n"
+        "- Do not include the answer text\n\n"
         f"MODE: {mode}\n"
         f"ANSWER (do not reveal): {answer}\n"
         f"META: {safe_json_dumps(meta)}\n"
@@ -221,25 +220,70 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
         "temperature": 0.4,
     }
 
+    def extract_text(resp_json: Dict[str, Any]) -> str:
+        # Most common:
+        t = (resp_json.get("output_text") or "").strip()
+        if t:
+            return t
+
+        # Fallback: traverse output blocks
+        out = resp_json.get("output") or []
+        parts: List[str] = []
+        for item in out:
+            for c in (item.get("content") or []):
+                if c.get("type") in ("output_text", "text"):
+                    txt = c.get("text") or ""
+                    if txt:
+                        parts.append(txt)
+        return "\n".join(parts).strip()
+
+    def try_parse_json(text: str) -> Dict[str, Any]:
+        # Strict
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # Recover if model added extra text around JSON
+        # Find first '{' and last '}' and try that substring.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = text[start : end + 1]
+            return json.loads(snippet)
+
+        raise ValueError("No JSON object found in model output.")
+
     last_err = None
+    last_preview = ""
+
     for _ in range(3):
-        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
         if r.status_code >= 400:
             last_err = RuntimeError(f"OpenAI error {r.status_code}: {r.text[:500]}")
             time.sleep(0.6)
             continue
 
         data = r.json()
-        text = (data.get("output_text") or "").strip()
+        text = extract_text(data)
+        last_preview = (text[:220] + ("..." if len(text) > 220 else "")) if text else "<empty>"
 
         try:
-            obj = json.loads(text)
+            obj = try_parse_json(text)
+
             clues = obj.get("clues")
             if not isinstance(clues, list) or len(clues) != n_clues:
-                raise ValueError("Wrong clues format.")
+                raise ValueError("Wrong JSON shape. Expected {'clues':[...]} with correct length.")
 
-            cleaned = []
+            cleaned: List[str] = []
             low_ans = answer.lower()
+
             for c in clues:
                 c = clamp_words(str(c).strip(), MAX_CLUE_WORDS)
                 if not c:
@@ -254,7 +298,8 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
             last_err = e
             time.sleep(0.6)
 
-    raise RuntimeError(f"Failed to generate clues. Last error: {last_err}")
+    raise RuntimeError(f"Failed to generate clues. Last output preview: {last_preview}. Last error: {last_err}")
+
 
 
 # ----------------------------
