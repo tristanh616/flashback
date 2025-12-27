@@ -208,11 +208,9 @@ FORBIDDEN_PATTERNS = [
 ]
 
 FORBIDDEN_WORDS = {
-    "director", "directed", "starring", "cast", "actor", "actress",
-    "season", "episode", "imdb", "tmdb", "spotify", "netflix", "disney",
-    "marvel", "dc",
-    "horror", "comedy", "thriller", "romance", "action", "drama", "sci-fi", "scifi", "fantasy",
+    "imdb", "tmdb", "spotify", "netflix", "disney",
 }
+
 
 COMPLEX_WORDS = {
     "explores", "examine", "examines", "reflects", "depicts", "portrays", "juxtaposes",
@@ -261,27 +259,50 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
     n_clues = max(2, min(n_clues, 12))
 
     system = (
-        "You write clue sentences for a party guessing game.\n"
-        "Sound like a normal person talking, not like a critic.\n"
-        "Use simple, everyday words.\n"
-        "Avoid fancy vocabulary and abstract phrasing.\n"
-        "Never reveal the answer.\n"
-        "Never use names, dates, decades, awards, or genre labels.\n"
-        "Write natural sentences, not lists."
+    "You write clue sentences for a party guessing game.\n"
+    "Use plain, spoken English, like a friend talking.\n"
+    "Clues must vary in type across the list.\n"
+    "For movies, you may sometimes use: genre hint, decade, soundtrack vibe, setting, ONE actor, director.\n"
+    "Only use actor or director in later clues, never early.\n"
+    "Never reveal the title.\n"
+    "Do not use character names.\n"
+    "Avoid fancy vocabulary.\n"
+    "Write one sentence per clue, not lists."
     )
 
     def clue_role(i: int) -> str:
-        if i == 1:
-            return "Very broad vibe and time-feel, no facts."
-        if i == 2:
-            return "What people remember feeling or arguing about."
-        if i == 3:
-            return "Why people still bring it up, without specifics."
-        if i <= 5:
-            return "More familiar hints using simple words, still not factual."
-        if i <= 8:
-            return "Stronger hints that narrow the vibe, still no identifiers."
-        return "Final hints that feel close, still no names or direct facts."
+        if mode == "movie":
+            if i == 1:
+                return "Broad vibe and what kind of night it feels like."
+            if i == 2:
+                return "Very general setting hint without names."
+            if i == 3:
+                return "Genre hint, but use simple words."
+            if i == 4:
+                return "Soundtrack or audio vibe hint."
+            if i == 5:
+                return "Clearer setting hint, still no names."
+            if i == 6:
+                return "Decade hint like 1990s or 2000s, not a year."
+            if i == 7:
+                return "Mention ONE actor from META, only first or last name, no character names."
+            if i == 8:
+                return "Mention the director from META, but keep the sentence casual."
+            return "Final hint: combine two earlier categories without being too direct."
+
+        if mode == "music":
+            if i == 1:
+                return "Broad vibe and where it fits socially."
+            if i == 2:
+                return "What it sounds like, instruments or production feel."
+            if i == 3:
+                return "Genre-ish hint without using strict labels."
+            if i == 4:
+                return "Decade hint like 2010s or 1990s, not a year."
+            if i == 5:
+                return "How people use it (party, gym, sad hours, throwback), keep it broad."
+            return "Final hint that narrows the vibe without naming the artist."
+
 
     def build_user_prompt(extra_rule: str) -> str:
         role_lines = "\n".join([f"- Clue {i}: {clue_role(i)}" for i in range(1, n_clues + 1)])
@@ -300,6 +321,8 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
             "- Do not use genre labels (examples: horror, comedy, action, drama, sci-fi)\n"
             "- Do not include the answer text or close paraphrases of it\n"
             "- Clues must be broad and indirect, but get gradually more suggestive as they progress\n"
+            "- If MODE is movie: you may mention ONE actor OR the director OR the decade, but only after clue 5.\n"
+            "- Never mention character names.\n"
             "Clue role progression:\n"
             f"{role_lines}\n"
             f"{extra_rule}\n"
