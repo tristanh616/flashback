@@ -344,6 +344,7 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
             "- Clues must be broad and indirect, but get gradually more suggestive as they progress\n"
             "- Even if the clues must be broad and indirect, it needs to give the person reading and idea of what the movie or show is, without directly saying it\n"
             "- The first clue should be broad and general, but as we move forward, it needs to have familiar hint that narrows it, still no identifiers"
+            "- The hints needs to be easy for someone to remember, so keep the clues simple"
             f"- If MODE is movie: you may use ONE concrete hint starting at clue {trivia_start} (decade like 1990s, or one actor, or the director)\n"
             "- Do not use character names\n"
             "- Never mention character names.\n"
