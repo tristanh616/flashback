@@ -11,12 +11,12 @@
     <main class="wrap">
       <header class="header">
         <h1>{{ "Movie/Show" if mode == "movie" else "Music" }} Card</h1>
-        <p class="sub">Tap to reveal. Timer forces a clean pass.</p>
+        <p class="sub">Players: {{ players }}. Clues: {{ total_clues }}.</p>
       </header>
 
       <section class="card center">
         {% if current_clue %}
-          <div class="pill">Clue {{ step }} / 3</div>
+          <div class="pill">Clue {{ step }} / {{ total_clues }}</div>
           <p class="big">{{ current_clue }}</p>
 
           <p class="hint">
@@ -32,7 +32,7 @@
                 seconds -= 1;
                 if (seconds <= 0) {
                   clearInterval(t);
-                  window.location.href = "/c/{{ card_id }}?step=0";
+                  window.location.href = "/c/{{ card_id }}?step={{ step }}&show=0";
                   return;
                 }
                 el.textContent = String(seconds);
@@ -44,27 +44,27 @@
           <div class="pill">Answer</div>
           <p class="big"><strong>{{ answer }}</strong></p>
           <div class="actions">
-            <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
+            <a class="btn secondary" href="/c/{{ card_id }}?step=0&show=0">Restart</a>
           </div>
 
         {% else %}
           <div class="pill">Ready</div>
-          <p class="big">Pass the phone. Tap when ready.</p>
+          <p class="big">Pass the phone. Tap to reveal.</p>
 
           <div class="actions">
-            {% if step < 3 %}
-              <a class="btn" href="/c/{{ card_id }}?step={{ step + 1 }}">Reveal next clue</a>
-            {% elif step == 3 %}
-              <a class="btn" href="/c/{{ card_id }}?step=4">Reveal answer</a>
+            {% if step < total_clues %}
+              <a class="btn" href="/c/{{ card_id }}?step={{ step + 1 }}&show=1">Reveal next clue</a>
+            {% elif step == total_clues %}
+              <a class="btn" href="/c/{{ card_id }}?step={{ total_clues + 1 }}&show=1">Reveal answer</a>
             {% else %}
-              <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
+              <a class="btn secondary" href="/c/{{ card_id }}?step=0&show=0">Restart</a>
             {% endif %}
           </div>
-        {% endif %}
 
-        <p class="hint">
-          Rule: once revealed, read it silently, then pass when it auto-hides.
-        </p>
+          <p class="hint">
+            The clue will auto-hide, then you pass.
+          </p>
+        {% endif %}
       </section>
     </main>
   </body>
