@@ -3,84 +3,42 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Create Card</title>
+    <title>Card</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
 
   <body>
     <main class="wrap">
       <header class="header">
-        <h1>Create a Card</h1>
-        <p class="sub">This will pre-generate clues and produce a QR code.</p>
+        <h1>{{ "Movie/Show" if mode == "movie" else "Music" }} Card</h1>
+        <p class="sub">Pass the phone. Tap once per reveal.</p>
       </header>
 
-      <section class="grid">
-        <form class="card" method="post" action="/create">
-          <h2>Random Movie (TMDb)</h2>
-          <p>Generates a random popular movie and creates 3 clues.</p>
-          <input type="hidden" name="kind" value="tmdb_random_movie" />
-          <button class="btn" type="submit">Generate TMDb Movie Card</button>
-        </form>
+      <section class="card center">
+        {% if current_clue %}
+          <div class="pill">Clue {{ step }} / 3</div>
+          <p class="big">{{ current_clue }}</p>
+        {% elif reveal_answer %}
+          <div class="pill">Answer</div>
+          <p class="big"><strong>{{ answer }}</strong></p>
+        {% else %}
+          <div class="pill">Ready</div>
+          <p class="big">No clue revealed yet.</p>
+        {% endif %}
 
-        <form class="card" method="post" action="/create">
-          <h2>Random Track (Spotify Playlist)</h2>
-          <p>Pick a random track from a playlist ID you provide.</p>
+        <div class="actions">
+          {% if step < 3 %}
+            <a class="btn" href="/c/{{ card_id }}?step={{ step + 1 }}">Next clue</a>
+          {% elif step == 3 %}
+            <a class="btn" href="/c/{{ card_id }}?step=4">Reveal answer</a>
+          {% else %}
+            <a class="btn secondary" href="/c/{{ card_id }}?step=0">Restart</a>
+          {% endif %}
+        </div>
 
-          <input type="hidden" name="kind" value="spotify_random_from_playlist" />
-
-          <label class="label">
-            Playlist ID
-            <input
-              class="input"
-              name="playlist_id"
-              placeholder="e.g. 37i9dQZF1DXcBWIGoYBM5M"
-              value="{{ default_playlist_id }}"
-              required
-            />
-          </label>
-
-          <button class="btn" type="submit">Generate Spotify Track Card</button>
-
-          <p class="hint">
-            Tip: using one curated family-friendly playlist is smarter than letting Spotify pick from anywhere.
-          </p>
-        </form>
-
-        <form class="card" method="post" action="/create">
-          <h2>Manual Answer (AI Clues)</h2>
-          <p>You choose the answer. The AI generates the clues.</p>
-
-          <input type="hidden" name="kind" value="manual" />
-
-          <label class="label">
-            Mode
-            <select class="input" name="mode">
-              <option value="movie">Movie/Show</option>
-              <option value="music">Music</option>
-            </select>
-          </label>
-
-          <label class="label">
-            Answer (hidden)
-            <input
-              class="input"
-              name="answer"
-              placeholder="e.g. The Dark Knight OR Blinding Lights - The Weeknd"
-              required
-            />
-          </label>
-
-          <button class="btn" type="submit">Generate Manual Card</button>
-
-          <p class="hint">
-            Skeptical warning: if you type the answer poorly (typos, missing artist), the AI clues will degrade.
-          </p>
-        </form>
-      </section>
-
-      <section class="card">
-        <h2>Back</h2>
-        <a class="btn secondary" href="/">Home</a>
+        <p class="hint">
+          Rule suggestion: once someone taps “Next clue”, they must pass the phone immediately.
+        </p>
       </section>
     </main>
   </body>
