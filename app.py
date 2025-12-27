@@ -14,10 +14,6 @@ import requests
 import qrcode
 from flask import Flask, render_template, redirect, url_for, request, abort, send_file
 
-
-# ----------------------------
-# Configuration (ENV VARS)
-# ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
@@ -30,109 +26,52 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEFAULT_SPOTIFY_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "").strip()
 SPOTIFY_MARKET = os.getenv("SPOTIFY_MARKET", "CA").strip()
 
-# Heroku note: /tmp can be wiped on dyno restart. OK for family MVP.
 DB_PATH = os.path.join("/tmp", "game.db")
-
-# Optional: set BASE_URL like https://your-app.herokuapp.com
 BASE_URL = os.getenv("BASE_URL", "").strip()
 
 BASE_TIMER_SECONDS = int(os.getenv("BASE_TIMER_SECONDS", "8"))
-
-# You used this before for keyword clues. Sentences need more room.
-# You can still override it via env var.
 MAX_CLUE_WORDS = int(os.getenv("MAX_CLUE_WORDS", "18"))
 
 app = Flask(__name__)
 
-
-# ----------------------------
-# Database
-# ----------------------------
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
-def safe_json_dumps(obj: Any) -> str:
+def safe_json_dumps(obj):
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
-
-def safe_json_loads(s: str) -> Any:
+def safe_json_loads(s):
     try:
         return json.loads(s)
     except Exception:
         return {}
 
-
 def init_db():
     with db() as conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS cards (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-
                 mode TEXT NOT NULL,
                 source TEXT NOT NULL,
-                players INTEGER NOT NULL DEFAULT 4,
-
+                players INTEGER NOT NULL,
                 answer TEXT NOT NULL,
                 meta_json TEXT NOT NULL,
-
-                clues_json TEXT NOT NULL DEFAULT '[]',
+                clues_json TEXT NOT NULL,
                 qr_png BLOB NOT NULL
             )
-            """
-        )
-
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(cards)").fetchall()]
-        cols_set = set(cols)
-
-        if "players" not in cols_set:
-            conn.execute("ALTER TABLE cards ADD COLUMN players INTEGER NOT NULL DEFAULT 4")
-            cols_set.add("players")
-
-        if "clues_json" not in cols_set:
-            conn.execute("ALTER TABLE cards ADD COLUMN clues_json TEXT NOT NULL DEFAULT '[]'")
-            cols_set.add("clues_json")
-
-        # Backfill from old schema if it exists
-        if {"clue1", "clue2", "clue3"}.issubset(cols_set):
-            rows = conn.execute(
-                "SELECT id, clue1, clue2, clue3, clues_json FROM cards"
-            ).fetchall()
-
-            for row in rows:
-                current = row["clues_json"] or "[]"
-                try:
-                    parsed = json.loads(current)
-                except Exception:
-                    parsed = []
-
-                if not isinstance(parsed, list) or len(parsed) == 0:
-                    clues = [row["clue1"], row["clue2"], row["clue3"]]
-                    clues = [c for c in clues if c]
-                    conn.execute(
-                        "UPDATE cards SET clues_json = ? WHERE id = ?",
-                        (safe_json_dumps(clues), row["id"]),
-                    )
-
+        """)
         conn.commit()
-
 
 init_db()
 
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def make_id(n: int = 6) -> str:
+def make_id(n=6):
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(n))
 
-
-def sanitize_base_url(raw: str) -> str:
+def sanitize_base_url(raw):
     raw = (raw or "").strip()
     if not raw:
         return ""
@@ -141,36 +80,27 @@ def sanitize_base_url(raw: str) -> str:
         return raw.rstrip("/")
     return f"{p.scheme}://{p.netloc}"
 
+def resolve_base_url(req_host_url):
+    return sanitize_base_url(BASE_URL or req_host_url)
 
-def resolve_base_url(req_host_url: str) -> str:
-    if BASE_URL:
-        return sanitize_base_url(BASE_URL)
-    return sanitize_base_url(req_host_url)
-
-
-def make_qr_png_bytes(url: str) -> bytes:
+def make_qr_png_bytes(url):
     img = qrcode.make(url)
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-
-def clamp_players(value: str) -> int:
+def clamp_players(value):
     try:
-        p = int((value or "4").strip())
-    except ValueError:
+        p = int(value)
+    except Exception:
         p = 4
     return max(2, min(p, 12))
 
+def clue_count_for_players(players):
+    return clamp_players(players)
 
-def clue_count_for_players(players: int) -> int:
-    # One clue per person
-    p = max(2, min(int(players), 12))
-    return p
-
-
-def timer_for_players(players: int) -> int:
-    p = max(2, min(players, 12))
+def timer_for_players(players):
+    p = clamp_players(players)
     if p <= 2:
         return max(5, BASE_TIMER_SECONDS - 1)
     if p <= 4:
@@ -179,632 +109,116 @@ def timer_for_players(players: int) -> int:
         return BASE_TIMER_SECONDS + 1
     return BASE_TIMER_SECONDS + 2
 
+def clamp_words(s, max_words):
+    return " ".join((s or "").split()[:max_words])
 
-def clamp_words(s: str, max_words: int) -> str:
-    parts = (s or "").strip().split()
-    return " ".join(parts[:max_words])
+STOP_WORDS = {"the","a","an","and","or","of","to","in","on","for","with","from","by","at","is","it","this","that","as","are"}
 
+def normalize_tokens(s):
+    s = re.sub(r"[^a-z0-9\s]", " ", (s or "").lower())
+    return [t for t in s.split() if t and t not in STOP_WORDS]
 
-# ----------------------------
-# Answer leak detection
-# ----------------------------
-STOP_WORDS = {
-    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "from", "by", "at",
-    "is", "it", "this", "that", "as", "are"
-}
-
-
-def normalize_tokens(s: str) -> List[str]:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    toks = [t for t in s.split() if t and t not in STOP_WORDS]
-    return toks
-
-
-def clue_leaks_answer(answer: str, clue: str, mode: str) -> bool:
-    a = (answer or "").strip()
-    c = (clue or "").strip()
-    if not a or not c:
-        return False
-
-    # Always block full exact substring match
-    if a.lower() in c.lower():
-        return True
-
-    # Music answer convention: "Track - Artist"
-    if mode == "music" and " - " in a:
-        track, artist = a.split(" - ", 1)
-        track_toks = set(normalize_tokens(track))
-        artist_toks = set(normalize_tokens(artist))
-        clue_toks = set(normalize_tokens(c))
-
-        # If clue contains 2+ meaningful tokens from track or artist, treat as leak
-        if len(track_toks) >= 2 and len(track_toks & clue_toks) >= 2:
-            return True
-        if len(artist_toks) >= 2 and len(artist_toks & clue_toks) >= 2:
-            return True
-
-        # Also block exact track phrase if present
-        if track.strip() and track.lower() in c.lower():
-            return True
-
-        return False
-
-    # Movies/shows/manual: treat answer as title
-    title_toks = set(normalize_tokens(a))
-    clue_toks = set(normalize_tokens(c))
-
-    if len(title_toks) <= 2:
-        # Short titles need strict handling
-        if len(title_toks & clue_toks) >= 1 and len(title_toks) >= 1:
-            return True
-        return False
-
-    # Longer titles: leak if 3+ meaningful tokens appear
-    if len(title_toks & clue_toks) >= 3:
-        return True
-
-    return False
-
-
-# ----------------------------
-# Extra clue rules: sentences, broad, indirect, progressive narrowing
-# ----------------------------
-FORBIDDEN_PATTERNS = [
-    re.compile(r"\b(19|20)\d{2}\b"),             # year-like tokens
-    re.compile(r"\b(oscar|academy award|grammy|emmy|golden globe|bafta)\b", re.I),
-    re.compile(r"\b(released|premiered|debuted)\b", re.I),
-]
-
-FORBIDDEN_WORDS = {
-    # These tend to turn into direct trivia.
-    "director", "directed", "starring", "cast", "actor", "actress",
-    "season", "episode", "imdb", "tmdb", "spotify", "netflix", "disney",
-    "marvel", "dc",
-    # Genre labels that make deduction too easy. Keep it mood-based instead.
-    "horror", "comedy", "thriller", "romance", "action", "drama", "sci-fi", "scifi", "fantasy",
-}
-
-
-def looks_like_list_or_keywords(s: str) -> bool:
-    t = (s or "").strip()
-    if not t:
-        return True
-    # Colon is often used for list-style hints; ban it.
-    if ":" in t:
-        return True
-    # Multiple separators often indicates keyword lists.
-    if " / " in t or " | " in t or ";" in t:
-        return True
-    # Too few words often becomes keywords.
-    if len(t.split()) < 6:
+def clue_leaks_answer(answer, clue, mode):
+    if answer.lower() in clue.lower():
         return True
     return False
 
-
-def violates_sentence_rules(clue: str) -> bool:
-    c = (clue or "").strip()
-    if not c:
+def violates_sentence_rules(clue):
+    if len(clue.split()) < 6:
         return True
-
-    lower = c.lower()
-
-    for pat in FORBIDDEN_PATTERNS:
-        if pat.search(c):
-            return True
-
-    toks = set(normalize_tokens(c))
-    if any(w in toks for w in FORBIDDEN_WORDS):
+    if ":" in clue or ";" in clue:
         return True
-
-    # We want natural sentences, not bullet fragments.
-    if looks_like_list_or_keywords(c):
+    if re.search(r"\b(19|20)\d{2}\b", clue):
         return True
-
     return False
 
-
-# ----------------------------
-# OpenAI clue generation (robust)
-# ----------------------------
-def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues: int) -> List[str]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Missing OPENAI_API_KEY env var.")
-
+def openai_generate_clues(mode, answer, meta, n_clues):
     n_clues = max(2, min(n_clues, 12))
-
-    # Stronger system instruction: we want a specific style and structure.
     system = (
-        "You write clue sentences for a party guessing game.\n"
-        "Your clues must be indirect, broad, and not identifiable by a single keyword.\n"
-        "Never reveal the answer. Never use names, dates, or genre labels.\n"
-        "Write natural sentences, not lists."
+        "Write clues like a normal person talking out loud.\n"
+        "Use simple words.\n"
+        "Do not sound poetic, academic, or polished.\n"
+        "Do not explain things clearly.\n"
+        "Sound slightly unsure or casual.\n"
+        "Never use names, dates, or genres.\n"
+        "Never reveal the answer."
     )
 
-    # Progressive narrowing roles. Clue 1 stays abstract, clue 2 focuses on audience memory,
-    # clue 3 focuses on cultural footprint. Extra clues continue narrowing without identifiers.
-    def clue_role(i: int) -> str:
+    def role(i):
         if i == 1:
-            return "Very abstract cultural context and atmosphere. No facts."
+            return "Very vague memory of the time or feeling."
         if i == 2:
-            return "Audience experience and what people remember feeling or debating."
+            return "What people remember feeling or arguing about."
         if i == 3:
-            return "Long-term footprint and why it is referenced, without naming it."
-        if i <= 5:
-            return "Narrow further using themes and social memory, still avoiding identifiers."
-        if i <= 8:
-           return "Be more suggestive through recognizable patterns, but still not factual."
-        return "Final hints: strong vibe and implication, still no names or direct facts."
+            return "Why people still bring it up."
+        if i <= 6:
+            return "More familiar hints without facts."
+        return "Strong but indirect hints."
 
-    
-
-    def build_user_prompt(extra_rule: str) -> str:
-        role_lines = "\n".join([f"- Clue {i}: {clue_role(i)}" for i in range(1, n_clues + 1)])
-        return (
-            "Generate escalating clue sentences for a QR party guessing game.\n"
-            "Return strict JSON only in this exact format:\n"
-            "{\"clues\":[\"...\",\"...\"]}\n"
-            "Hard rules:\n"
-            f"- Exactly {n_clues} clues\n"
-            f"- Each clue is one single sentence, max {MAX_CLUE_WORDS} words\n"
-            "- No lists, no bullet points, no colons\n"
-            "- No names of people, characters, places, brands, or studios\n"
-            "- No dates, years, decades, or award mentions\n"
-            "- Do not use genre labels (examples: horror, comedy, action, drama, sci-fi)\n"
-            "- Do not include the answer text or close paraphrases of it\n"
-            "- Clues must be broad and indirect, but get gradually more suggestive as they progress\n"
-            "Clue role progression:\n"
-            f"{role_lines}\n"
-            f"{extra_rule}\n"
-            f"MODE: {mode}\n"
-            f"ANSWER (do not reveal): {answer}\n"
-            f"META (do not quote; only use for vibe): {safe_json_dumps(meta)}\n"
-        )
+    prompt = (
+        "Return strict JSON only:\n"
+        "{\"clues\":[\"...\"]}\n"
+        f"Exactly {n_clues} clues.\n"
+        f"Each one sentence, max {MAX_CLUE_WORDS} words.\n"
+    )
+    for i in range(1, n_clues + 1):
+        prompt += f"Clue {i}: {role(i)}\n"
+    prompt += f"ANSWER: {answer}\nMETA: {safe_json_dumps(meta)}"
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
-    def extract_text(resp_json: Dict[str, Any]) -> str:
-        t = (resp_json.get("output_text") or "").strip()
-        if t:
-            return t
-
-        out = resp_json.get("output") or []
-        parts: List[str] = []
-        for item in out:
-            for c in (item.get("content") or []):
-                if c.get("type") in ("output_text", "text"):
-                    txt = c.get("text") or ""
-                    if txt:
-                        parts.append(txt)
-        return "\n".join(parts).strip()
-
-    def try_parse_json(text: str) -> Dict[str, Any]:
+    for _ in range(7):
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json={
+                "model": OPENAI_MODEL,
+                "input": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.65
+            },
+            timeout=30
+        )
+        text = r.json().get("output_text", "")
         try:
-            return json.loads(text)
-        except Exception:
-            pass
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start:end + 1])
-
-        raise ValueError("No JSON object found in model output.")
-
-    last_err = None
-    last_preview = ""
-    extra_rule = ""
-
-    for attempt in range(5):
-        payload = {
-            "model": OPENAI_MODEL,
-            "input": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": build_user_prompt(extra_rule)},
-            ],
-            "temperature": 0.55,
-        }
-
-        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
-
-        if r.status_code >= 400:
-            last_err = RuntimeError(f"OpenAI error {r.status_code}: {r.text[:500]}")
-            time.sleep(0.6)
-            continue
-
-        data = r.json()
-        text = extract_text(data)
-        last_preview = (text[:220] + ("..." if len(text) > 220 else "")) if text else "<empty>"
-
-        try:
-            obj = try_parse_json(text)
+            obj = json.loads(text[text.find("{"):text.rfind("}") + 1])
             clues = obj.get("clues")
-
             if not isinstance(clues, list) or len(clues) != n_clues:
-                raise ValueError("Wrong JSON shape or wrong clue count.")
-
-            cleaned: List[str] = []
+                continue
+            out = []
             for c in clues:
-                c = clamp_words(str(c).strip(), MAX_CLUE_WORDS)
-                if not c:
-                    raise ValueError("Empty clue.")
-                if clue_leaks_answer(answer, c, mode):
-                    raise ValueError("LEAK")
+                c = clamp_words(c.strip(), MAX_CLUE_WORDS)
                 if violates_sentence_rules(c):
-                    raise ValueError("STYLE")
-                cleaned.append(c)
+                    raise ValueError
+                if clue_leaks_answer(answer, c, mode):
+                    raise ValueError
+                out.append(c)
+            return out
+        except Exception:
+            time.sleep(0.4)
+    raise RuntimeError("Clue generation failed")
 
-            return cleaned
-
-        except Exception as e:
-            last_err = e
-
-            # Tighten prompt depending on failure mode
-            if str(e) == "LEAK":
-                extra_rule = (
-                    "- Extra rule: avoid any proper nouns entirely. "
-                    "Do not mention any names, titles, places, or organizations.\n"
-                )
-            elif str(e) == "STYLE":
-                extra_rule = (
-                    "- Extra rule: each clue must be a natural full sentence with 6 to 18 words. "
-                    "No lists, no trivia words, no genre labels.\n"
-                )
-
-            time.sleep(0.6)
-
-    raise RuntimeError(f"Failed to generate clues. Last output preview: {last_preview}. Last error: {last_err}")
-
-
-# ----------------------------
-# TMDb helpers
-# ----------------------------
-def tmdb_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not TMDB_API_KEY:
-        raise RuntimeError("Missing TMDB_API_KEY env var.")
-    base = "https://api.themoviedb.org/3"
-    p = params or {}
-    p["api_key"] = TMDB_API_KEY
-    p.setdefault("language", TMDB_LANG)
-    r = requests.get(f"{base}{path}", params=p, timeout=20)
-    if r.status_code >= 400:
-        raise RuntimeError(f"TMDb error {r.status_code}: {r.text[:500]}")
-    return r.json()
-
-
-def pick_random_tmdb_movie() -> (str, Dict[str, Any]):
-    page = random.randint(1, 20)
-    discover = tmdb_get(
-        "/discover/movie",
-        params={
-            "sort_by": "popularity.desc",
-            "include_adult": "true" if TMDB_INCLUDE_ADULT else "false",
-            "page": page,
-        },
-    )
-    results = discover.get("results") or []
-    if not results:
-        raise RuntimeError("TMDb returned no movies.")
-
-    movie = random.choice(results)
-    movie_id = movie.get("id")
-    title = (movie.get("title") or movie.get("original_title") or "Unknown").strip()
-    release_date = (movie.get("release_date") or "").strip()
-    year = release_date[:4] if release_date else ""
-
-    details = tmdb_get(f"/movie/{movie_id}", params={})
-    credits = tmdb_get(f"/movie/{movie_id}/credits", params={})
-
-    genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
-    overview = (details.get("overview") or "").strip()
-
-    cast = []
-    for c in (credits.get("cast") or [])[:6]:
-        n = c.get("name")
-        if n:
-            cast.append(n)
-
-    director = ""
-    for crew in (credits.get("crew") or []):
-        if crew.get("job") == "Director":
-            director = crew.get("name") or ""
-            break
-
-    meta = {
-        "type": "movie",
-        "title": title,
-        "year": year,
-        "genres": genres,
-        "overview": overview,
-        "director": director,
-        "top_cast": cast,
-        "tmdb_id": movie_id,
-    }
-    return title, meta
-
-
-# ----------------------------
-# Spotify helpers
-# ----------------------------
-_SPOTIFY_TOKEN_CACHE = {"token": "", "expires_at": 0}
-
-
-def spotify_get_token() -> str:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        raise RuntimeError("Missing SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET env var.")
-
-    now = int(time.time())
-    if _SPOTIFY_TOKEN_CACHE["token"] and now < _SPOTIFY_TOKEN_CACHE["expires_at"] - 30:
-        return _SPOTIFY_TOKEN_CACHE["token"]
-
-    r = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={"grant_type": "client_credentials"},
-        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-        timeout=20,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Spotify token error {r.status_code}: {r.text[:500]}")
-
-    data = r.json()
-    token = data.get("access_token", "")
-    expires_in = int(data.get("expires_in", 3600))
-    _SPOTIFY_TOKEN_CACHE["token"] = token
-    _SPOTIFY_TOKEN_CACHE["expires_at"] = now + expires_in
-    return token
-
-
-def spotify_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    token = spotify_get_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(f"https://api.spotify.com/v1{path}", headers=headers, params=params or {}, timeout=20)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Spotify error {r.status_code}: {r.text[:500]}")
-    return r.json()
-
-
-def pick_random_spotify_track_from_playlist(playlist_id: str) -> (str, Dict[str, Any]):
-    if not playlist_id:
-        raise RuntimeError("Missing playlist_id.")
-
-    first = spotify_get(f"/playlists/{playlist_id}/tracks", params={"market": SPOTIFY_MARKET, "limit": 1, "offset": 0})
-    total = int(first.get("total") or 0)
-    if total <= 0:
-        raise RuntimeError("Playlist empty or inaccessible.")
-
-    limit = 100 if total >= 100 else total
-    max_offset = max(0, total - limit)
-    offset = random.randint(0, max_offset) if max_offset > 0 else 0
-
-    page = spotify_get(
-        f"/playlists/{playlist_id}/tracks",
-        params={"market": SPOTIFY_MARKET, "limit": limit, "offset": offset},
-    )
-
-    items = page.get("items") or []
-    tracks = []
-    for it in items:
-        t = (it.get("track") or {})
-        if not t or t.get("type") != "track" or t.get("is_local"):
-            continue
-        name = (t.get("name") or "").strip()
-        artists = [a.get("name") for a in (t.get("artists") or []) if a.get("name")]
-        if name and artists:
-            tracks.append(t)
-
-    if not tracks:
-        raise RuntimeError("No valid tracks found.")
-
-    t = random.choice(tracks)
-    name = (t.get("name") or "").strip()
-    artists = [a.get("name") for a in (t.get("artists") or []) if a.get("name")]
-    album = ((t.get("album") or {}).get("name") or "").strip()
-    release_date = ((t.get("album") or {}).get("release_date") or "").strip()
-    year = release_date[:4] if release_date else ""
-
-    answer = f"{name} - {artists[0]}"
-    meta = {
-        "type": "music",
-        "track_name": name,
-        "artists": artists,
-        "album": album,
-        "year": year,
-        "spotify_id": t.get("id"),
-        "preview_url": t.get("preview_url"),
-        "external_url": ((t.get("external_urls") or {}).get("spotify") or ""),
-        "playlist_id": playlist_id,
-    }
-    return answer, meta
-
-
-# ----------------------------
-# Card creation
-# ----------------------------
-def create_card(mode: str, source: str, players: int, answer: str, meta: Dict[str, Any], base_url: str) -> str:
-    n_clues = clue_count_for_players(players)
-
-    try:
-        clues = openai_generate_clues(mode=mode, answer=answer, meta=meta, n_clues=n_clues)
-    except Exception:
-        # Hard fallback so your game still works (now sentence-style)
-        if mode == "movie":
-            pool = [
-                "People remember it more for its mood than its plot.",
-                "It sparked debates about trust and control without giving easy answers.",
-                "Many references to it exist even among people who never watched it.",
-                "It feels familiar, yet it refuses to be comforting.",
-                "It leaves viewers arguing about what it really meant."
-            ]
-        else:
-            pool = [
-                "It is the kind of track people recognize before they can name it.",
-                "The vibe is instantly familiar, even if the details blur.",
-                "It fits a moment in pop culture that many people still talk about.",
-                "It has a hook that sticks in your head longer than you want.",
-                "It is often referenced in playlists and throwback conversations."
-            ]
-        clues = pool[:n_clues]
-
+def create_card(mode, source, players, answer, meta, base_url):
+    clues = openai_generate_clues(mode, answer, meta, clue_count_for_players(players))
     card_id = make_id()
-    created_at = datetime.utcnow().isoformat()
-
     scan_url = f"{base_url}/c/{card_id}"
-    qr_bytes = make_qr_png_bytes(scan_url)
-
+    qr = make_qr_png_bytes(scan_url)
     with db() as conn:
         conn.execute(
-            """
-            INSERT INTO cards (id, created_at, mode, source, players, answer, meta_json, clues_json, qr_png)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT INTO cards VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 card_id,
-                created_at,
+                datetime.utcnow().isoformat(),
                 mode,
                 source,
                 players,
                 answer,
                 safe_json_dumps(meta),
                 safe_json_dumps(clues),
-                sqlite3.Binary(qr_bytes),
-            ),
+                sqlite3.Binary(qr)
+            )
         )
         conn.commit()
-
     return card_id
-
-
-# ----------------------------
-# Routes
-# ----------------------------
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/create", methods=["GET", "POST"])
-def create():
-    if request.method == "GET":
-        return render_template("create.html", default_playlist_id=DEFAULT_SPOTIFY_PLAYLIST_ID)
-
-    kind = (request.form.get("kind") or "").strip()
-    players = clamp_players(request.form.get("players") or "4")
-    base_url = resolve_base_url(request.host_url)
-
-    try:
-        if kind == "tmdb_random_movie":
-            answer, meta = pick_random_tmdb_movie()
-            card_id = create_card("movie", "tmdb", players, answer, meta, base_url)
-            return redirect(url_for("card_admin", card_id=card_id))
-
-        if kind == "spotify_random_from_playlist":
-            playlist_id = (request.form.get("playlist_id") or DEFAULT_SPOTIFY_PLAYLIST_ID).strip()
-            answer, meta = pick_random_spotify_track_from_playlist(playlist_id)
-            card_id = create_card("music", "spotify", players, answer, meta, base_url)
-            return redirect(url_for("card_admin", card_id=card_id))
-
-        if kind == "manual":
-            mode = (request.form.get("mode") or "movie").strip()
-            answer = (request.form.get("answer") or "").strip()
-            if not answer:
-                return "Missing answer.", 400
-            meta = {"type": mode, "note": "manual_entry"}
-            card_id = create_card(mode, "manual", players, answer, meta, base_url)
-            return redirect(url_for("card_admin", card_id=card_id))
-
-        return "Unknown kind.", 400
-
-    except Exception as e:
-        return f"Create failed: {type(e).__name__}: {e}", 500
-
-
-@app.route("/admin/<card_id>")
-def card_admin(card_id):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-    if not row:
-        abort(404)
-
-    base_url = resolve_base_url(request.host_url)
-    meta = safe_json_loads(row["meta_json"])
-    clues = safe_json_loads(row["clues_json"])
-    if not isinstance(clues, list):
-        clues = []
-
-    return {
-        "card_id": card_id,
-        "players": int(row["players"] or 4),
-        "qr_image": f"{base_url}/qr/{card_id}.png",
-        "scan_url": f"{base_url}/c/{card_id}",
-        "mode": row["mode"],
-        "source": row["source"],
-        "answer": row["answer"],
-        "clues": clues,
-        "meta": meta,
-    }
-
-
-@app.route("/qr/<card_id>.png")
-def qr_png(card_id):
-    with db() as conn:
-        row = conn.execute("SELECT qr_png FROM cards WHERE id = ?", (card_id,)).fetchone()
-    if not row:
-        abort(404)
-
-    data = row["qr_png"]
-    if not data:
-        abort(404)
-
-    return send_file(BytesIO(data), mimetype="image/png", download_name=f"{card_id}.png")
-
-
-@app.route("/c/<card_id>")
-def card_view(card_id):
-    with db() as conn:
-        row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-    if not row:
-        abort(404)
-
-    step_str = request.args.get("step", "0")
-    try:
-        step = int(step_str)
-    except ValueError:
-        step = 0
-    step = max(0, min(step, 99))
-
-    show = (request.args.get("show", "0").strip() == "1")
-
-    players = int(row["players"] or 4)
-    timer_seconds = timer_for_players(players)
-
-    clues = safe_json_loads(row["clues_json"])
-    if not isinstance(clues, list) or not clues:
-        clues = []
-    total_clues = len(clues)
-
-    current_clue = None
-    reveal_answer = False
-
-    if show:
-        if 1 <= step <= total_clues:
-            current_clue = str(clues[step - 1])
-        elif step == total_clues + 1:
-            reveal_answer = True
-
-    return render_template(
-        "card.html",
-        mode=row["mode"],
-        card_id=card_id,
-        players=players,
-        timer_seconds=timer_seconds,
-        answer=row["answer"],
-        step=step,
-        show=show,
-        total_clues=total_clues,
-        current_clue=current_clue,
-        reveal_answer=reveal_answer,
-    )
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
