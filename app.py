@@ -37,7 +37,10 @@ DB_PATH = os.path.join("/tmp", "game.db")
 BASE_URL = os.getenv("BASE_URL", "").strip()
 
 BASE_TIMER_SECONDS = int(os.getenv("BASE_TIMER_SECONDS", "8"))
-MAX_CLUE_WORDS = int(os.getenv("MAX_CLUE_WORDS", "8"))
+
+# You used this before for keyword clues. Sentences need more room.
+# You can still override it via env var.
+MAX_CLUE_WORDS = int(os.getenv("MAX_CLUE_WORDS", "18"))
 
 app = Flask(__name__)
 
@@ -161,12 +164,9 @@ def clamp_players(value: str) -> int:
 
 
 def clue_count_for_players(players: int) -> int:
-    p = max(2, min(players, 12))
-    if p <= 4:
-        return 3
-    if p <= 7:
-        return 4
-    return 5
+    # One clue per person
+    p = max(2, min(int(players), 12))
+    return p
 
 
 def timer_for_players(players: int) -> int:
@@ -248,30 +248,117 @@ def clue_leaks_answer(answer: str, clue: str, mode: str) -> bool:
 
 
 # ----------------------------
+# Extra clue rules: sentences, broad, indirect, progressive narrowing
+# ----------------------------
+FORBIDDEN_PATTERNS = [
+    re.compile(r"\b(19|20)\d{2}\b"),             # year-like tokens
+    re.compile(r"\b(oscar|academy award|grammy|emmy|golden globe|bafta)\b", re.I),
+    re.compile(r"\b(released|premiered|debuted)\b", re.I),
+]
+
+FORBIDDEN_WORDS = {
+    # These tend to turn into direct trivia.
+    "director", "directed", "starring", "cast", "actor", "actress",
+    "season", "episode", "imdb", "tmdb", "spotify", "netflix", "disney",
+    "marvel", "dc",
+    # Genre labels that make deduction too easy. Keep it mood-based instead.
+    "horror", "comedy", "thriller", "romance", "action", "drama", "sci-fi", "scifi", "fantasy",
+}
+
+
+def looks_like_list_or_keywords(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return True
+    # Colon is often used for list-style hints; ban it.
+    if ":" in t:
+        return True
+    # Multiple separators often indicates keyword lists.
+    if " / " in t or " | " in t or ";" in t:
+        return True
+    # Too few words often becomes keywords.
+    if len(t.split()) < 6:
+        return True
+    return False
+
+
+def violates_sentence_rules(clue: str) -> bool:
+    c = (clue or "").strip()
+    if not c:
+        return True
+
+    lower = c.lower()
+
+    for pat in FORBIDDEN_PATTERNS:
+        if pat.search(c):
+            return True
+
+    toks = set(normalize_tokens(c))
+    if any(w in toks for w in FORBIDDEN_WORDS):
+        return True
+
+    # We want natural sentences, not bullet fragments.
+    if looks_like_list_or_keywords(c):
+        return True
+
+    return False
+
+
+# ----------------------------
 # OpenAI clue generation (robust)
 # ----------------------------
 def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues: int) -> List[str]:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY env var.")
 
-    n_clues = max(3, min(n_clues, 6))
-    system = "You generate short party-game clues. Never reveal the answer."
+    n_clues = max(2, min(n_clues, 12))
+
+    # Stronger system instruction: we want a specific style and structure.
+    system = (
+        "You write clue sentences for a party guessing game.\n"
+        "Your clues must be indirect, broad, and not identifiable by a single keyword.\n"
+        "Never reveal the answer. Never use names, dates, or genre labels.\n"
+        "Write natural sentences, not lists."
+    )
+
+    # Progressive narrowing roles. Clue 1 stays abstract, clue 2 focuses on audience memory,
+    # clue 3 focuses on cultural footprint. Extra clues continue narrowing without identifiers.
+    def clue_role(i: int) -> str:
+        if i == 1:
+            return "Very abstract cultural context and atmosphere. No facts."
+        if i == 2:
+            return "Audience experience and what people remember feeling or debating."
+        if i == 3:
+            return "Long-term footprint and why it is referenced, without naming it."
+        if i <= 5:
+            return "Narrow further using themes and social memory, still avoiding identifiers."
+        if i <= 8:
+           return "Be more suggestive through recognizable patterns, but still not factual."
+        return "Final hints: strong vibe and implication, still no names or direct facts."
+
+    
 
     def build_user_prompt(extra_rule: str) -> str:
+        role_lines = "\n".join([f"- Clue {i}: {clue_role(i)}" for i in range(1, n_clues + 1)])
         return (
-            "Generate escalating clues for a QR party guessing game.\n"
+            "Generate escalating clue sentences for a QR party guessing game.\n"
             "Return strict JSON only in this exact format:\n"
             "{\"clues\":[\"...\",\"...\"]}\n"
-            "Rules:\n"
+            "Hard rules:\n"
             f"- Exactly {n_clues} clues\n"
-            f"- Each clue max {MAX_CLUE_WORDS} words\n"
-            "- Prefer keywords, not sentences\n"
-            "- No commas, no semicolons, no parentheses\n"
-            "- Do not include the answer text\n"
+            f"- Each clue is one single sentence, max {MAX_CLUE_WORDS} words\n"
+            "- No lists, no bullet points, no colons\n"
+            "- No names of people, characters, places, brands, or studios\n"
+            "- No dates, years, decades, or award mentions\n"
+            "- Do not use genre labels (examples: horror, comedy, action, drama, sci-fi)\n"
+            "- Do not include the answer text or close paraphrases of it\n"
+            "- Clues must be broad and indirect, but get gradually more suggestive as they progress\n"
+            "Clue role progression:\n"
+            f"{role_lines}\n"
             f"{extra_rule}\n"
             f"MODE: {mode}\n"
             f"ANSWER (do not reveal): {answer}\n"
-            f"META: {safe_json_dumps(meta)}\n"
+            f"META (do not quote; only use for vibe): {safe_json_dumps(meta)}\n"
         )
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -308,14 +395,14 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
     last_preview = ""
     extra_rule = ""
 
-    for attempt in range(4):
+    for attempt in range(5):
         payload = {
             "model": OPENAI_MODEL,
             "input": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": build_user_prompt(extra_rule)},
             ],
-            "temperature": 0.4,
+            "temperature": 0.55,
         }
 
         r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
@@ -343,6 +430,8 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
                     raise ValueError("Empty clue.")
                 if clue_leaks_answer(answer, c, mode):
                     raise ValueError("LEAK")
+                if violates_sentence_rules(c):
+                    raise ValueError("STYLE")
                 cleaned.append(c)
 
             return cleaned
@@ -350,9 +439,18 @@ def openai_generate_clues(mode: str, answer: str, meta: Dict[str, Any], n_clues:
         except Exception as e:
             last_err = e
 
-            # If leak, tighten prompt and try again
+            # Tighten prompt depending on failure mode
             if str(e) == "LEAK":
-                extra_rule = "- Extra rule: do not use names from the title. Avoid character names. Avoid proper nouns that match the answer.\n"
+                extra_rule = (
+                    "- Extra rule: avoid any proper nouns entirely. "
+                    "Do not mention any names, titles, places, or organizations.\n"
+                )
+            elif str(e) == "STYLE":
+                extra_rule = (
+                    "- Extra rule: each clue must be a natural full sentence with 6 to 18 words. "
+                    "No lists, no trivia words, no genre labels.\n"
+                )
+
             time.sleep(0.6)
 
     raise RuntimeError(f"Failed to generate clues. Last output preview: {last_preview}. Last error: {last_err}")
@@ -528,11 +626,24 @@ def create_card(mode: str, source: str, players: int, answer: str, meta: Dict[st
     try:
         clues = openai_generate_clues(mode=mode, answer=answer, meta=meta, n_clues=n_clues)
     except Exception:
-        # Hard fallback so your game still works
+        # Hard fallback so your game still works (now sentence-style)
         if mode == "movie":
-            clues = ["popular title", "genre hint", "famous cast", "director clue", "iconic scenes"][:n_clues]
+            pool = [
+                "People remember it more for its mood than its plot.",
+                "It sparked debates about trust and control without giving easy answers.",
+                "Many references to it exist even among people who never watched it.",
+                "It feels familiar, yet it refuses to be comforting.",
+                "It leaves viewers arguing about what it really meant."
+            ]
         else:
-            clues = ["popular track", "genre vibe", "well known artist", "hit era", "catchy hook"][:n_clues]
+            pool = [
+                "It is the kind of track people recognize before they can name it.",
+                "The vibe is instantly familiar, even if the details blur.",
+                "It fits a moment in pop culture that many people still talk about.",
+                "It has a hook that sticks in your head longer than you want.",
+                "It is often referenced in playlists and throwback conversations."
+            ]
+        clues = pool[:n_clues]
 
     card_id = make_id()
     created_at = datetime.utcnow().isoformat()
