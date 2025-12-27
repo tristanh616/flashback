@@ -61,25 +61,53 @@ def init_db():
                 answer TEXT NOT NULL,
                 meta_json TEXT NOT NULL,
 
-                clues_json TEXT NOT NULL,    -- JSON list of clues
+                clues_json TEXT NOT NULL DEFAULT '[]',
                 qr_png BLOB NOT NULL
             )
             """
         )
 
-        # Migrations for older DBs, if needed
-        try:
-            conn.execute("ALTER TABLE cards ADD COLUMN players INTEGER NOT NULL DEFAULT 4")
-        except sqlite3.OperationalError:
-            pass
+        # Inspect existing columns to migrate older schemas.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(cards)").fetchall()]
+        cols_set = set(cols)
 
-        # If you previously used clue1/clue2/clue3, we do not depend on them anymore.
-        # If your DB is old, easiest is to let it create a new DB in /tmp on restart.
+        # Ensure players exists (older versions may not have it)
+        if "players" not in cols_set:
+            conn.execute("ALTER TABLE cards ADD COLUMN players INTEGER NOT NULL DEFAULT 4")
+            cols_set.add("players")
+
+        # If migrating from the older schema that had clue1/2/3:
+        if "clues_json" not in cols_set:
+            conn.execute("ALTER TABLE cards ADD COLUMN clues_json TEXT NOT NULL DEFAULT '[]'")
+            cols_set.add("clues_json")
+
+        # Backfill clues_json from clue1/2/3 if those columns exist
+        if {"clue1", "clue2", "clue3"}.issubset(cols_set):
+            rows = conn.execute(
+                """
+                SELECT id, clue1, clue2, clue3, clues_json
+                FROM cards
+                """
+            ).fetchall()
+
+            for row in rows:
+                current = row["clues_json"] or "[]"
+                try:
+                    parsed = json.loads(current)
+                except Exception:
+                    parsed = []
+
+                # Only backfill if it's empty or invalid
+                if not isinstance(parsed, list) or len(parsed) == 0:
+                    clues = [row["clue1"], row["clue2"], row["clue3"]]
+                    clues = [c for c in clues if c]
+                    conn.execute(
+                        "UPDATE cards SET clues_json = ? WHERE id = ?",
+                        (safe_json_dumps(clues), row["id"]),
+                    )
 
         conn.commit()
 
-
-init_db()
 
 
 # ----------------------------
